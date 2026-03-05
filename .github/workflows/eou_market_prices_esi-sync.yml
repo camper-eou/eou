@@ -47,7 +47,7 @@ jobs:
 
       ESI_BASE: https://esi.evetech.net/latest
       ESI_DATASOURCE: tranquility
-      ESI_USER_AGENT: "eou-market-prices/1.0 (ops@yourmail.tld; +https://github.com/camper-eou/eou)"
+      ESI_USER_AGENT: "eou-market-prices/1.0 (+https://github.com/camper-eou/eou)"
 
     steps:
       - name: Checkout (camper-eou/eou)
@@ -55,7 +55,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout inputs + output repo (landu-eou/eou)
+      - name: Checkout output repo (landu-eou/eou)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.LANDU_OWNER }}/${{ env.LANDU_REPO }}
@@ -80,6 +80,18 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      # (Opcional pero recomendado) sincroniza landu antes de generar para reducir conflictos
+      - name: Sync landu repo (pre-run)
+        env:
+          LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
+        run: |
+          set -euo pipefail
+          cd "${LANDU_DIR}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
+          git pull --rebase origin "${LANDU_REF}"
 
       - name: Run pipeline (fetch → dedupe → compute → write gz)
         env:
@@ -117,6 +129,7 @@ jobs:
           git commit -m "EOU: update market orders pages cache"
           git push
 
+      # ✅ FIX: stash -> pull --rebase -> stash pop, luego commit/push
       - name: Commit marketPices.json.gz (landu-eou/eou)
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
@@ -124,12 +137,24 @@ jobs:
           set -euo pipefail
 
           cd "${LANDU_DIR}"
-          git config --unset-all http.https://github.com/.extraheader || true
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # URL con PAT para pull/push
+          git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
+
+          # Si el pipeline generó cambios, el repo está sucio -> stash antes de pull
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git stash push -u -m "ci: stash before pull"
+          fi
+
           git pull --rebase origin "${LANDU_REF}"
+
+          # re-aplica cambios generados
+          if git stash list | grep -q "ci: stash before pull"; then
+            git stash pop || true
+          fi
 
           git add "${OUT_REL}" || true
           if git diff --cached --quiet; then
@@ -138,6 +163,4 @@ jobs:
           fi
 
           git commit -m "EOU: update marketPices.json.gz"
-
-          git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git push origin "${LANDU_REF}"
