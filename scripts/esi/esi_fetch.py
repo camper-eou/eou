@@ -79,7 +79,6 @@ class EsiClient:
 
 
 def _sleep_from_headers(resp: requests.Response, default_s: int = 30) -> int:
-    # Modern rate limit: 429 + Retry-After
     ra = resp.headers.get("Retry-After")
     if ra is not None:
         try:
@@ -87,7 +86,6 @@ def _sleep_from_headers(resp: requests.Response, default_s: int = 30) -> int:
         except Exception:
             pass
 
-    # Legacy error limit headers: if remain is low, sleep reset
     err_rem = resp.headers.get("X-Esi-Error-Limit-Remain")
     err_reset = resp.headers.get("X-Esi-Error-Limit-Reset")
     try:
@@ -109,9 +107,7 @@ def fetch_entity(
 ) -> Tuple[Optional[int], bool]:
     """
     Fetch all pages for one entity, pushing minimal orders via push_orders_fn(list_of_min_orders).
-
     Returns: (pages_observed, ignored_flag)
-    ignored_flag True means structure was ignored (e.g. 404 on page1 twice or 4xx non-retriable).
     """
     pages_observed: Optional[int] = None
     ignored = False
