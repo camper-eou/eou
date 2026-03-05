@@ -9,7 +9,7 @@ SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
 
 def read_tokens_from_sheet(spreadsheet_id: str, range_a1: str) -> List[str]:
-    # Uses Application Default Credentials provided by google-github-actions/auth (WIF/OIDC)
+    # Uses ADC provided by google-github-actions/auth (WIF/OIDC)
     creds, _ = google.auth.default(scopes=[SHEETS_READONLY_SCOPE])
     service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
