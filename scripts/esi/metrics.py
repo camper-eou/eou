@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 MAD_TO_SIGMA = 1.4826
 TAU = 3.0
@@ -19,7 +19,7 @@ def _median(xs: List[float]) -> Optional[float]:
     return (xs[mid - 1] + xs[mid]) / 2.0
 
 
-def _vwap(entries: Iterable[Tuple[float, int]]) -> Optional[float]:
+def _vwap(entries: List[Tuple[float, int]]) -> Optional[float]:
     num = 0.0
     den = 0
     for p, u in entries:
@@ -148,7 +148,7 @@ def compute_sell(entries: List[Tuple[float, int]]) -> dict:
         uniq = sorted(set(prices))
         if len(uniq) >= 2 and uniq[1] > 0:
             p1, p2 = uniq[0], uniq[1]
-            U_non_info = (U >= 10.0 * p2)  # regla práctica
+            U_non_info = (U >= 10.0 * p2)
             if U_non_info:
                 g_low = (p2 - p1) / p2
                 if g_low >= G_MIN:
