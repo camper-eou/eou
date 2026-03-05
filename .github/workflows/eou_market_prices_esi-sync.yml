@@ -1,0 +1,143 @@
+name: ESI Market Prices (ESI → GH)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Ignorar cache planner (pages cache) y reconstruir planificación (usar con cuidado)"
+        required: false
+        type: boolean
+        default: false
+      max_workers:
+        description: "Workers internos para ingesta ESI (paralelismo dentro del runner)"
+        required: false
+        type: number
+        default: 8
+      retry_budget:
+        description: "Presupuesto global de retries (401/420/429/5xx)"
+        required: false
+        type: number
+        default: 10
+
+concurrency:
+  group: eou_market_prices_esi_gh
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      LANDU_OWNER: landu-eou
+      LANDU_REPO: eou
+      LANDU_REF: main
+      LANDU_DIR: landu
+
+      OUT_REL: data/esi/marketPices.json.gz
+      PAGES_CACHE_REL: states/market_orders_pages.json
+
+      SHEETS_ID: 1fnoPr1HoO6RuQxoFY_jUVc8yTfiGa0yZ-WaxgOwWJe8
+      SHEETS_RANGE: access_tokens!D2:D12
+
+      ESI_BASE: https://esi.evetech.net/latest
+      ESI_DATASOURCE: tranquility
+      ESI_USER_AGENT: "eou-market-prices/1.0 (ops@yourmail.tld; +https://github.com/camper-eou/eou)"
+
+    steps:
+      - name: Checkout (camper-eou/eou)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout inputs + output repo (landu-eou/eou)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LANDU_OWNER }}/${{ env.LANDU_REPO }}
+          ref: ${{ env.LANDU_REF }}
+          path: ${{ env.LANDU_DIR }}
+          token: ${{ secrets.LANDU_EOU_PAT }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Auth to Google (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Run pipeline (fetch → dedupe → compute → write gz)
+        env:
+          FORCE_REFRESH: ${{ inputs.force_refresh }}
+          MAX_WORKERS: ${{ inputs.max_workers }}
+          RETRY_BUDGET: ${{ inputs.retry_budget }}
+        run: |
+          set -euo pipefail
+
+          python scripts/esi/market_prices_pipeline.py \
+            --landu-root "${LANDU_DIR}" \
+            --out "${LANDU_DIR}/${OUT_REL}" \
+            --pages-cache "${PAGES_CACHE_REL}" \
+            --sheets-id "${SHEETS_ID}" \
+            --sheets-range "${SHEETS_RANGE}" \
+            --esi-base "${ESI_BASE}" \
+            --datasource "${ESI_DATASOURCE}" \
+            --user-agent "${ESI_USER_AGENT}" \
+            --max-workers "${MAX_WORKERS}" \
+            --retry-budget "${RETRY_BUDGET}" \
+            $( [ "${FORCE_REFRESH}" = "true" ] && echo "--force-refresh" )
+
+      - name: Commit pages cache (camper-eou/eou)
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${PAGES_CACHE_REL}" || true
+          if git diff --cached --quiet; then
+            echo "No pages cache changes."
+            exit 0
+          fi
+
+          git commit -m "EOU: update market orders pages cache"
+          git push
+
+      - name: Commit marketPices.json.gz (landu-eou/eou)
+        env:
+          LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
+        run: |
+          set -euo pipefail
+
+          cd "${LANDU_DIR}"
+          git config --unset-all http.https://github.com/.extraheader || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin "${LANDU_REF}"
+
+          git add "${OUT_REL}" || true
+          if git diff --cached --quiet; then
+            echo "No marketPices changes."
+            exit 0
+          fi
+
+          git commit -m "EOU: update marketPices.json.gz"
+
+          git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
+          git push origin "${LANDU_REF}"
