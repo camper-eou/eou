@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Make sibling modules importable when executed as a script:
 sys.path.insert(0, os.path.dirname(__file__))
 
 from esi_fetch import Entity, EsiClient, RetryBudget, TokenManager, fetch_entity
@@ -28,8 +27,8 @@ LOG = logging.getLogger("market_prices_pipeline")
 
 @dataclass
 class PagesCache:
-    stations: Dict[int, int]     # regionID -> pages
-    structures: Dict[int, int]   # structureID -> pages
+    stations: Dict[int, int]
+    structures: Dict[int, int]
 
 
 def load_pages_cache(path: Path) -> Optional[PagesCache]:
@@ -245,7 +244,7 @@ def main() -> None:
                 else:
                     observed_structs[ent.id] = pages
 
-    LOG.info("Starting ingestion (conservative retries; obeying Retry-After)")
+    LOG.info("Starting ingestion")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(worker_fn, b) for b in bins if b]
         for f in concurrent.futures.as_completed(futs):
@@ -310,7 +309,7 @@ def main() -> None:
     hs_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_sell ORDER BY type_id, location_id, price ASC;"))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    LOG.info("Writing NDJSON.gz to %s (one line per type)", out_path)
+    LOG.info("Writing NDJSON.gz to %s", out_path)
 
     with gzip.open(out_path, "wt", encoding="utf-8") as gz:
         for t in types:
