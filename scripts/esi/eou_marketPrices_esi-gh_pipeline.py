@@ -7,6 +7,7 @@ import gzip
 import importlib.util
 import json
 import logging
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,11 +18,25 @@ LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
 
 
 def _load_module(module_tag: str):
+    """
+    Carga un módulo hermano cuyo nombre de fichero contiene '-',
+    por lo que no es importable con 'import' normal.
+
+    IMPORTANTÍSIMO:
+    Insertamos el módulo en sys.modules ANTES de exec_module
+    para que dataclasses y typing puedan resolver cls.__module__.
+    """
     filename = BASE_DIR / f"eou_marketPrices_esi-gh_{module_tag}.py"
-    spec = importlib.util.spec_from_file_location(f"eou_marketPrices_{module_tag}", filename)
+    mod_name = f"eou_marketPrices_esi_gh_{module_tag}"  # sin '-' para sys.modules
+    spec = importlib.util.spec_from_file_location(mod_name, filename)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module from {filename}")
+
     mod = importlib.util.module_from_spec(spec)
+
+    # ✅ FIX: registrar en sys.modules antes de ejecutar
+    sys.modules[spec.name] = mod
+
     spec.loader.exec_module(mod)
     return mod
 
@@ -107,7 +122,7 @@ def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]
     if total_orders <= 0:
         return 0, []
 
-    threshold = total_orders * 0.0175  # CAMBIO PEDIDO: 1.75%
+    threshold = total_orders * 0.0175  # 1.75%
 
     rows = conn.execute(
         """
@@ -416,18 +431,10 @@ def main() -> None:
             for hub in hubs:
                 loc = int(hub["stationID"])
                 name = str(hub["station"])
-                prices.append(
-                    build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, []))
-                )
+                prices.append(build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, [])))
 
-            gz.write(
-                json.dumps(
-                    {"typeID": tid, "type": t.type_name, "prices": prices},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+            gz.write(json.dumps({"typeID": tid, "type": t.type_name, "prices": prices},
+                                ensure_ascii=False, separators=(",", ":")) + "\n")
 
     write_hubs_json(hubs_out_path, total_orders, hubs)
     LOG.info("Wrote hubs json to %s", hubs_out_path)
