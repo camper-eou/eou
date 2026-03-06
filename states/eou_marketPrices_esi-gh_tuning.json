@@ -1,0 +1,65 @@
+{
+  "current": {
+    "max_workers": 11,
+    "retry_budget": 10
+  },
+  "best": {
+    "max_workers": 10,
+    "retry_budget": 10,
+    "score": 1714.0,
+    "ingestSeconds": 1712.4
+  },
+  "history": [
+    {
+      "ts": "2026-03-06T00:20:11Z",
+      "max_workers": 10,
+      "retry_budget": 10,
+      "ingestSeconds": 1712.4,
+      "retriesUsed": 3,
+      "ok": true,
+      "totalOrders": 1673309,
+      "requests": 842,
+      "http401": 1,
+      "http404": 52,
+      "http420": 0,
+      "http429": 0,
+      "http5xx": 0,
+      "backoffSeconds": 3.0,
+      "score": 1714.0
+    },
+    {
+      "ts": "2026-03-07T00:19:48Z",
+      "max_workers": 11,
+      "retry_budget": 10,
+      "ingestSeconds": 1668.9,
+      "retriesUsed": 7,
+      "ok": true,
+      "totalOrders": 1675120,
+      "requests": 847,
+      "http401": 2,
+      "http404": 53,
+      "http420": 0,
+      "http429": 0,
+      "http5xx": 1,
+      "backoffSeconds": 36.0,
+      "score": 1696.9
+    },
+    {
+      "ts": "2026-03-08T00:22:03Z",
+      "max_workers": 12,
+      "retry_budget": 10,
+      "ingestSeconds": 1625.7,
+      "retriesUsed": 10,
+      "ok": false,
+      "totalOrders": 0,
+      "requests": 533,
+      "http401": 1,
+      "http404": 27,
+      "http420": 1,
+      "http429": 4,
+      "http5xx": 0,
+      "backoffSeconds": 141.0,
+      "score": 2006.2
+    }
+  ]
+}
