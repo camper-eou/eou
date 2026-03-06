@@ -1,7 +1,7 @@
 {
   "version": 1,
   "current": {
-    "max_workers": 15,
+    "max_workers": 16,
     "retry_budget": 10
   },
   "best": {
@@ -60,6 +60,23 @@
         "backoffSeconds": 0.0,
         "requests": 1796,
         "score": 203.85926652900002
+      }
+    },
+    {
+      "ts": "2026-03-06T09:13:58Z",
+      "selected": {
+        "max_workers": 16,
+        "retry_budget": 10
+      },
+      "result": {
+        "ok": true,
+        "ingestSeconds": 217.570906212,
+        "retriesUsed": 0,
+        "http401": 0,
+        "http429": 0,
+        "backoffSeconds": 0.0,
+        "requests": 1794,
+        "score": 217.570906212
       }
     }
   ]
