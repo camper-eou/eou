@@ -28,7 +28,6 @@ def _load_module(module_tag: str):
     spec = importlib.util.spec_from_file_location(mod_name, filename)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module from {filename}")
-
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -319,82 +318,6 @@ def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: i
     return (clamp(best_workers, min_workers, max_workers), clamp(best_retry, min_retry, max_retry))
 
 
-def update_tuning_state(
-    state: Dict,
-    selected_workers: int,
-    selected_retry_budget: int,
-    ok: bool,
-    ingest_seconds: float,
-    stats: Dict[str, float],
-    retries_used: int,
-) -> Dict:
-    ts = _utc_now_iso()
-
-    history_item = {
-        "ts": ts,
-        "selected": {
-            "max_workers": int(selected_workers),
-            "retry_budget": int(selected_retry_budget),
-        },
-        "result": {
-            "ok": bool(ok),
-            "ingestSeconds": float(ingest_seconds),
-            "retriesUsed": int(retries_used),
-            "http401": int(stats.get("http401", 0)),
-            "http429": int(stats.get("http429", 0)),
-            "backoffSeconds": float(stats.get("backoff_seconds", 0.0)),
-            "requests": int(stats.get("requests", 0)),
-            "score": compute_score(
-                ok=ok,
-                ingest_seconds=ingest_seconds,
-                http401=int(stats.get("http401", 0)),
-                http429=int(stats.get("http429", 0)),
-                backoff_seconds=float(stats.get("backoff_seconds", 0.0)),
-            ),
-        },
-    }
-
-    history = list(state.get("history", []))
-    history.append(history_item)
-    history = history[-5:]
-
-    best = dict(state.get("best", {}))
-    this_score = history_item["result"]["score"]
-    if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
-        best = {
-            "max_workers": int(selected_workers),
-            "retry_budget": int(selected_retry_budget),
-            "score": float(this_score),
-            "ts": ts,
-        }
-
-    temp_state = {
-        **state,
-        "history": history,
-        "best": best,
-        "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
-    }
-
-    next_workers, next_retry_budget = choose_tuned_parameters(
-        temp_state,
-        base_workers=selected_workers,
-        base_retry_budget=selected_retry_budget,
-    )
-
-    return {
-        "version": int(state.get("version", 1)),
-        "status": state.get("status", "in progress"),
-        "next_run": state.get("next_run"),
-        "failed": int(state.get("failed", 0)),
-        "current": {
-            "max_workers": int(next_workers),
-            "retry_budget": int(next_retry_budget),
-        },
-        "best": best,
-        "history": history,
-    }
-
-
 def write_run_metrics(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -444,11 +367,7 @@ def main() -> None:
         base_retry_budget=int(args.base_retry_budget),
     )
 
-    LOG.info(
-        "Autotuning selected max_workers=%s retry_budget=%s",
-        selected_workers,
-        selected_retry_budget,
-    )
+    LOG.info("Autotuning selected max_workers=%s retry_budget=%s", selected_workers, selected_retry_budget)
 
     try:
         LOG.info("Loading inputs from landu repo at %s", landu_root)
@@ -673,7 +592,6 @@ def main() -> None:
             base_retry_budget=int(args.base_retry_budget),
         )
 
-        from_state = tuning_state
         ts = _utc_now_iso()
 
         history_item = {
@@ -700,11 +618,11 @@ def main() -> None:
             },
         }
 
-        history = list(from_state.get("history", []))
+        history = list(tuning_state.get("history", []))
         history.append(history_item)
         history = history[-5:]
 
-        best = dict(from_state.get("best", {}))
+        best = dict(tuning_state.get("best", {}))
         this_score = history_item["result"]["score"]
         if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
             best = {
@@ -715,7 +633,7 @@ def main() -> None:
             }
 
         temp_state = {
-            **from_state,
+            **tuning_state,
             "history": history,
             "best": best,
             "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
@@ -728,10 +646,10 @@ def main() -> None:
         )
 
         new_tuning_state = {
-            "version": int(from_state.get("version", 1)),
-            "status": from_state.get("status", "in progress"),
-            "next_run": from_state.get("next_run"),
-            "failed": int(from_state.get("failed", 0)),
+            "version": int(tuning_state.get("version", 1)),
+            "status": tuning_state.get("status", "in progress"),
+            "next_run": tuning_state.get("next_run"),
+            "failed": int(tuning_state.get("failed", 0)),
             "current": {
                 "max_workers": int(next_workers),
                 "retry_budget": int(next_retry_budget),
@@ -751,6 +669,7 @@ def main() -> None:
                 },
                 "result": history_item["result"],
                 "next_current": new_tuning_state["current"],
+                "maxLastModified": stats_snapshot.get("max_last_modified"),
             },
         )
         LOG.info("Wrote tuning state to %s", tuning_state_path)
