@@ -10,11 +10,16 @@ import logging
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _load_module(module_tag: str):
@@ -36,7 +41,6 @@ sde_mod = _load_module("sde")
 sheets_mod = _load_module("sheets")
 sqlite_mod = _load_module("sqlite")
 types_mod = _load_module("types")
-tuning_mod = _load_module("tuning")
 
 Entity = fetch_mod.Entity
 EsiClient = fetch_mod.EsiClient
@@ -60,8 +64,35 @@ connect = sqlite_mod.connect
 detect_types_file = types_mod.detect_types_file
 load_types = types_mod.load_types
 
-load_tuning_state = tuning_mod.load_tuning_state
-choose_tuned_parameters = tuning_mod.choose_tuned_parameters
+
+def load_pages_cache(path: Path) -> Optional[Dict[str, Dict[int, int]]]:
+    if not path.exists():
+        return None
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    stations = {
+        int(x["regionID"]): int(x["pages"])
+        for x in obj.get("stations", [])
+        if "regionID" in x and "pages" in x
+    }
+    structures = {
+        int(x["stationID"]): int(x["pages"])
+        for x in obj.get("structures", [])
+        if "stationID" in x and "pages" in x
+    }
+    return {"stations": stations, "structures": structures}
+
+
+def write_pages_cache(
+    path: Path,
+    regions: List[Tuple[int, str, int]],
+    structures: List[Tuple[int, str, int]],
+) -> None:
+    out = {
+        "stations": [{"regionID": rid, "region": rname, "pages": pages} for rid, rname, pages in regions],
+        "structures": [{"stationID": sid, "station": sname, "pages": pages} for sid, sname, pages in structures],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
@@ -75,34 +106,7 @@ def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
     return bins
 
 
-def load_pages_cache(path: Path):
-    if not path.exists():
-        return None
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        "stations": {
-            int(x["regionID"]): int(x["pages"])
-            for x in obj.get("stations", [])
-            if "regionID" in x and "pages" in x
-        },
-        "structures": {
-            int(x["stationID"]): int(x["pages"])
-            for x in obj.get("structures", [])
-            if "stationID" in x and "pages" in x
-        },
-    }
-
-
-def write_pages_cache(path: Path, regions: List[Tuple[int, str, int]], structures: List[Tuple[int, str, int]]) -> None:
-    out = {
-        "stations": [{"regionID": rid, "region": rname, "pages": pages} for rid, rname, pages in regions],
-        "structures": [{"stationID": sid, "station": sname, "pages": pages} for sid, sname, pages in structures],
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def compute_hubs(conn, location_names: Dict[int, str]):
+def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]:
     total_orders = int(conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"])
     if total_orders <= 0:
         return 0, []
@@ -157,7 +161,7 @@ class TypeRowStream:
             return row
         return self.cur.fetchone()
 
-    def take_for_type(self, type_id: int):
+    def take_for_type(self, type_id: int) -> List[Tuple]:
         rows = []
         while True:
             row = self._next()
@@ -210,6 +214,186 @@ def write_hubs_json(path: Path, total_orders: int, hubs: List[Dict]) -> None:
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_tuning_state(path: Path, base_max_workers: int, base_retry_budget: int) -> Dict:
+    if not path.exists():
+        return {
+            "version": 1,
+            "status": "idle",
+            "next_run": None,
+            "failed": 0,
+            "current": {"max_workers": base_max_workers, "retry_budget": base_retry_budget},
+            "best": {"max_workers": base_max_workers, "retry_budget": base_retry_budget, "score": None, "ts": None},
+            "history": [],
+        }
+
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    obj.setdefault("version", 1)
+    obj.setdefault("status", "idle")
+    obj.setdefault("next_run", None)
+    obj.setdefault("failed", 0)
+    obj.setdefault("current", {"max_workers": base_max_workers, "retry_budget": base_retry_budget})
+    obj.setdefault("best", {"max_workers": base_max_workers, "retry_budget": base_retry_budget, "score": None, "ts": None})
+    obj.setdefault("history", [])
+    return obj
+
+
+def write_tuning_state(path: Path, state: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def compute_score(ok: bool, ingest_seconds: float, http401: int, http429: int, backoff_seconds: float) -> float:
+    score = float(ingest_seconds)
+    score += 15.0 * float(http429)
+    score += 5.0 * float(http401)
+    score += 0.5 * float(backoff_seconds)
+    if not ok:
+        score += 300.0
+    return score
+
+
+def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: int) -> Tuple[int, int]:
+    min_workers, max_workers = 4, 16
+    min_retry, max_retry = 10, 50
+
+    history = state.get("history", [])
+    best = state.get("best", {})
+    current = state.get("current", {})
+
+    if not history:
+        return (
+            clamp(int(current.get("max_workers", base_workers)), min_workers, max_workers),
+            clamp(int(current.get("retry_budget", base_retry_budget)), min_retry, max_retry),
+        )
+
+    best_score = best.get("score")
+    best_workers = int(best.get("max_workers", current.get("max_workers", base_workers)))
+    best_retry = int(best.get("retry_budget", current.get("retry_budget", base_retry_budget)))
+
+    last = history[-1]
+    last_selected = last.get("selected", {})
+    last_result = last.get("result", {})
+
+    last_ok = bool(last_result.get("ok", False))
+    last_429 = int(last_result.get("http429", 0))
+    last_backoff = float(last_result.get("backoffSeconds", 0.0))
+    last_retries = int(last_result.get("retriesUsed", 0))
+    last_budget = int(last_selected.get("retry_budget", best_retry))
+    last_workers = int(last_selected.get("max_workers", best_workers))
+    last_score = float(last_result.get("score", 1e18))
+
+    recent_pairs = {
+        (int(h.get("selected", {}).get("max_workers", best_workers)),
+         int(h.get("selected", {}).get("retry_budget", best_retry)))
+        for h in history[-5:]
+    }
+
+    if not last_ok:
+        return (clamp(best_workers, min_workers, max_workers), clamp(min(best_retry + 5, max_retry), min_retry, max_retry))
+
+    if last_429 > 0 or last_backoff > 120 or (last_budget > 0 and last_retries >= int(last_budget * 0.8)):
+        return (clamp(best_workers - 2, min_workers, max_workers), clamp(best_retry + 5, min_retry, max_retry))
+
+    if best_score is not None and last_score > float(best_score):
+        # Si el último empeora, volvemos al best.
+        return (clamp(best_workers, min_workers, max_workers), clamp(best_retry, min_retry, max_retry))
+
+    if best_score is not None and last_workers == best_workers and int(last_selected.get("retry_budget", best_retry)) == best_retry:
+        candidates = [
+            (best_workers + 2, best_retry),
+            (best_workers - 2, best_retry),
+            (best_workers, best_retry + 5),
+            (best_workers, best_retry - 5),
+        ]
+        for w, r in candidates:
+            w = clamp(w, min_workers, max_workers)
+            r = clamp(r, min_retry, max_retry)
+            if (w, r) not in recent_pairs:
+                return (w, r)
+
+    return (clamp(best_workers, min_workers, max_workers), clamp(best_retry, min_retry, max_retry))
+
+
+def update_tuning_state(
+    state: Dict,
+    selected_workers: int,
+    selected_retry_budget: int,
+    ok: bool,
+    ingest_seconds: float,
+    stats: Dict[str, float],
+    retries_used: int,
+) -> Dict:
+    ts = _utc_now_iso()
+
+    history_item = {
+        "ts": ts,
+        "selected": {
+            "max_workers": int(selected_workers),
+            "retry_budget": int(selected_retry_budget),
+        },
+        "result": {
+            "ok": bool(ok),
+            "ingestSeconds": float(ingest_seconds),
+            "retriesUsed": int(retries_used),
+            "http401": int(stats.get("http401", 0)),
+            "http429": int(stats.get("http429", 0)),
+            "backoffSeconds": float(stats.get("backoff_seconds", 0.0)),
+            "requests": int(stats.get("requests", 0)),
+            "score": compute_score(
+                ok=ok,
+                ingest_seconds=ingest_seconds,
+                http401=int(stats.get("http401", 0)),
+                http429=int(stats.get("http429", 0)),
+                backoff_seconds=float(stats.get("backoff_seconds", 0.0)),
+            ),
+        },
+    }
+
+    history = list(state.get("history", []))
+    history.append(history_item)
+    history = history[-5:]
+
+    best = dict(state.get("best", {}))
+    this_score = history_item["result"]["score"]
+    if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
+        best = {
+            "max_workers": int(selected_workers),
+            "retry_budget": int(selected_retry_budget),
+            "score": float(this_score),
+            "ts": ts,
+        }
+
+    temp_state = {
+        **state,
+        "history": history,
+        "best": best,
+        "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
+    }
+
+    next_workers, next_retry_budget = choose_tuned_parameters(
+        temp_state,
+        base_workers=selected_workers,
+        base_retry_budget=selected_retry_budget,
+    )
+
+    return {
+        "version": int(state.get("version", 1)),
+        "status": state.get("status", "in progress"),
+        "next_run": state.get("next_run"),
+        "failed": int(state.get("failed", 0)),
+        "current": {
+            "max_workers": int(next_workers),
+            "retry_budget": int(next_retry_budget),
+        },
+        "best": best,
+        "history": history,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
@@ -217,39 +401,48 @@ def main() -> None:
     ap.add_argument("--hubs-out", required=True)
     ap.add_argument("--pages-cache", required=True)
     ap.add_argument("--tuning-state", required=True)
-    ap.add_argument("--metrics-out", required=True)
     ap.add_argument("--sheets-id", required=True)
     ap.add_argument("--sheets-range", required=True)
     ap.add_argument("--esi-base", required=True)
     ap.add_argument("--datasource", required=True)
     ap.add_argument("--user-agent", required=True)
+    ap.add_argument("--base-max-workers", type=int, default=10)
+    ap.add_argument("--base-retry-budget", type=int, default=10)
+    ap.add_argument("--force-refresh", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     start_ts = time.perf_counter()
-    pipeline_ok = False
+    ok = False
     stats = StatsCollector()
-    retry_budget_obj = None
-    selected_workers = None
-    selected_retry_budget = None
+    retry_budget_obj: RetryBudget | None = None
 
     landu_root = Path(args.landu_root)
     out_path = Path(args.out)
     hubs_out_path = Path(args.hubs_out)
     pages_cache_path = Path(args.pages_cache)
     tuning_state_path = Path(args.tuning_state)
-    metrics_out_path = Path(args.metrics_out)
+
+    tuning_state = load_tuning_state(
+        tuning_state_path,
+        base_max_workers=int(args.base_max_workers),
+        base_retry_budget=int(args.base_retry_budget),
+    )
+
+    selected_workers, selected_retry_budget = choose_tuned_parameters(
+        tuning_state,
+        base_workers=int(args.base_max_workers),
+        base_retry_budget=int(args.base_retry_budget),
+    )
+
+    LOG.info(
+        "Autotuning selected max_workers=%s retry_budget=%s",
+        selected_workers,
+        selected_retry_budget,
+    )
 
     try:
-        tuning_state = load_tuning_state(tuning_state_path)
-        selected_workers, selected_retry_budget = choose_tuned_parameters(
-            tuning_state,
-            base_workers=int(tuning_state["current"]["max_workers"]),
-            base_retry_budget=int(tuning_state["current"]["retry_budget"]),
-        )
-
-        LOG.info("Autotuning selected max_workers=%s retry_budget=%s", selected_workers, selected_retry_budget)
         LOG.info("Loading inputs from landu repo at %s", landu_root)
 
         types_path = detect_types_file(landu_root)
@@ -266,7 +459,7 @@ def main() -> None:
             raise SystemExit("No tokens returned from Google Sheets.")
         token_mgr = TokenManager(tokens)
 
-        cache = load_pages_cache(pages_cache_path)
+        cache = None if args.force_refresh else load_pages_cache(pages_cache_path)
         LOG.info("Pages cache: %s", "enabled" if cache else "disabled")
 
         entities: List[Entity] = []
@@ -458,30 +651,26 @@ def main() -> None:
         LOG.info("Wrote pages cache to %s", pages_cache_path)
 
         conn.close()
-        pipeline_ok = True
+        ok = True
         LOG.info("Done.")
 
     finally:
         elapsed = time.perf_counter() - start_ts
-        retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
         stats_snapshot = stats.snapshot()
+        retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
 
-        metrics = {
-            "selected": {
-                "max_workers": int(selected_workers or 10),
-                "retry_budget": int(selected_retry_budget or 10),
-            },
-            "result": {
-                "pipelineOk": bool(pipeline_ok),
-                "ingestSeconds": float(elapsed),
-                "retriesUsed": int(retries_used),
-                "http401": int(stats_snapshot.get("http401", 0)),
-                "http429": int(stats_snapshot.get("http429", 0)),
-                "backoffSeconds": float(stats_snapshot.get("backoff_seconds", 0.0)),
-                "requests": int(stats_snapshot.get("requests", 0)),
-            },
-        }
+        new_tuning_state = update_tuning_state(
+            state=tuning_state,
+            selected_workers=selected_workers,
+            selected_retry_budget=selected_retry_budget,
+            ok=ok,
+            ingest_seconds=elapsed,
+            stats=stats_snapshot,
+            retries_used=retries_used,
+        )
+        write_tuning_state(tuning_state_path, new_tuning_state)
+        LOG.info("Wrote tuning state to %s", tuning_state_path)
 
-        metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_out_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        LOG.info("Wrote run metrics to %s", metrics_out_path)
+
+if __name__ == "__main__":
+    main()
