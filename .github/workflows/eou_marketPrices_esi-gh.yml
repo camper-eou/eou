@@ -12,7 +12,7 @@ on:
         description: "Workers internos para ingesta ESI (paralelismo dentro del runner)"
         required: false
         type: number
-        default: 8
+        default: 10
       retry_budget:
         description: "Presupuesto global de retries (401/420/429/5xx)"
         required: false
@@ -20,7 +20,7 @@ on:
         default: 10
 
 concurrency:
-  group: eou_market_prices_esi_gh
+  group: eou_marketPrices_esi_gh
   cancel-in-progress: false
 
 permissions:
@@ -40,7 +40,8 @@ jobs:
       LANDU_DIR: landu
 
       OUT_REL: data/esi/marketPices.json.gz
-      PAGES_CACHE_REL: states/market_orders_pages.json
+      HUBS_REL: data/esi/hubs.json
+      PAGES_CACHE_REL: states/eou_marketPrices_esi-gh_pages.json
 
       SHEETS_ID: 1fnoPr1HoO6RuQxoFY_jUVc8yTfiGa0yZ-WaxgOwWJe8
       SHEETS_RANGE: access_tokens!D2:D12
@@ -73,7 +74,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements/eou_marketPrices_esi-gh_requirements.txt
 
       - name: Auth to Google (WIF)
         uses: google-github-actions/auth@v2
@@ -81,7 +82,6 @@ jobs:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
-      # (Opcional pero recomendado) sincroniza landu antes de generar para reducir conflictos
       - name: Sync landu repo (pre-run)
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
@@ -93,7 +93,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git pull --rebase origin "${LANDU_REF}"
 
-      - name: Run pipeline (fetch → dedupe → compute → write gz)
+      - name: Run pipeline (fetch → dedupe → compute → write gz/json)
         env:
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           MAX_WORKERS: ${{ inputs.max_workers }}
@@ -101,9 +101,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          python scripts/esi/market_prices_pipeline.py \
+          python "scripts/esi/eou_marketPrices_esi-gh_pipeline.py" \
             --landu-root "${LANDU_DIR}" \
             --out "${LANDU_DIR}/${OUT_REL}" \
+            --hubs-out "${LANDU_DIR}/${HUBS_REL}" \
             --pages-cache "${PAGES_CACHE_REL}" \
             --sheets-id "${SHEETS_ID}" \
             --sheets-range "${SHEETS_RANGE}" \
@@ -126,41 +127,35 @@ jobs:
             exit 0
           fi
 
-          git commit -m "EOU: update market orders pages cache"
+          git commit -m "EOU: update market prices pages cache"
           git push
 
-      # ✅ FIX: stash -> pull --rebase -> stash pop, luego commit/push
-      - name: Commit marketPices.json.gz (landu-eou/eou)
+      - name: Commit marketPices.json.gz + hubs.json (landu-eou/eou)
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
         run: |
           set -euo pipefail
 
           cd "${LANDU_DIR}"
-
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # URL con PAT para pull/push
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
 
-          # Si el pipeline generó cambios, el repo está sucio -> stash antes de pull
           if [[ -n "$(git status --porcelain)" ]]; then
             git stash push -u -m "ci: stash before pull"
           fi
 
           git pull --rebase origin "${LANDU_REF}"
 
-          # re-aplica cambios generados
           if git stash list | grep -q "ci: stash before pull"; then
             git stash pop || true
           fi
 
-          git add "${OUT_REL}" || true
+          git add "${OUT_REL}" "${HUBS_REL}" || true
           if git diff --cached --quiet; then
-            echo "No marketPices changes."
+            echo "No marketPices/hubs changes."
             exit 0
           fi
 
-          git commit -m "EOU: update marketPices.json.gz"
+          git commit -m "EOU: update marketPices.json.gz + hubs.json"
           git push origin "${LANDU_REF}"
