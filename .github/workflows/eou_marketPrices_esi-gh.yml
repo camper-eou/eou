@@ -57,6 +57,7 @@ jobs:
       ESI_USER_AGENT: "eou-market-prices/1.0 (+https://github.com/camper-eou/eou)"
 
       RUN_METRICS_PATH: .tmp/eou_marketPrices_esi-gh_run_metrics.json
+      FINALIZE_SUMMARY_PATH: .tmp/eou_marketPrices_esi-gh_finalize_summary.json
 
     steps:
       - name: Checkout (camper-eou/eou)
@@ -100,7 +101,17 @@ jobs:
             --path "${TUNING_STATE_REL}" \
             --base-max-workers "${{ inputs.max_workers }}" \
             --base-retry-budget "${{ inputs.retry_budget }}" \
-            --lock-seconds "${LOCK_TIME}"
+            --lock-seconds "${LOCK_TIME}" \
+            --summary-path "${FINALIZE_SUMMARY_PATH}"
+
+      - name: Write initial status/next_run to Sheets
+        run: |
+          set -euo pipefail
+          python "scripts/esi/eou_marketPrices_esi-gh_sheet.py" \
+            --spreadsheet-id "${SHEETS_ID}" \
+            --sheet-tab "${SHEET_TAB}" \
+            --row "${SHEETS_WORKFLOW_ROW}" \
+            --summary-path "${FINALIZE_SUMMARY_PATH}"
 
       - name: Sync landu repo (pre-run)
         env:
@@ -148,7 +159,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
 
-          # Guardamos cambios locales antes de sincronizar
           if [[ -n "$(git status --porcelain)" ]]; then
             git stash push -u -m "ci: stash before pull"
           fi
@@ -167,16 +177,13 @@ jobs:
 
           git commit -m "EOU: update marketPices.json.gz + hubs.json"
 
-          # Reintento conservador por si otro workflow empuja entre nuestro pull y push
           pushed=0
           for attempt in 1 2 3; do
             echo "Push attempt ${attempt}/3"
-
             if git push origin "${LANDU_REF}"; then
               pushed=1
               break
             fi
-
             echo "Push rejected, trying pull --rebase and retry..."
             git pull --rebase origin "${LANDU_REF}"
           done
@@ -192,7 +199,9 @@ jobs:
           set -euo pipefail
           python "scripts/esi/eou_marketPrices_esi-gh_tuning.py" \
             finalize-success \
-            --path "${TUNING_STATE_REL}"
+            --path "${TUNING_STATE_REL}" \
+            --metrics-path "${RUN_METRICS_PATH}" \
+            --summary-path "${FINALIZE_SUMMARY_PATH}"
 
       - name: Finalize tuning state (failed)
         if: always() && steps.commit_landu.outcome != 'success'
@@ -200,7 +209,18 @@ jobs:
           set -euo pipefail
           python "scripts/esi/eou_marketPrices_esi-gh_tuning.py" \
             finalize-failure \
-            --path "${TUNING_STATE_REL}"
+            --path "${TUNING_STATE_REL}" \
+            --summary-path "${FINALIZE_SUMMARY_PATH}"
+
+      - name: Write final status/next_run(/last_modified) to Sheets
+        if: always()
+        run: |
+          set -euo pipefail
+          python "scripts/esi/eou_marketPrices_esi-gh_sheet.py" \
+            --spreadsheet-id "${SHEETS_ID}" \
+            --sheet-tab "${SHEET_TAB}" \
+            --row "${SHEETS_WORKFLOW_ROW}" \
+            --summary-path "${FINALIZE_SUMMARY_PATH}"
 
       - name: Commit camper state (pages + tuning)
         if: always()
