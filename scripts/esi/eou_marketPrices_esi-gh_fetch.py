@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
 
@@ -10,7 +11,7 @@ import requests
 
 @dataclass(frozen=True)
 class Entity:
-    kind: str  # "region" | "structure"
+    kind: str
     id: int
     name: str
     pages_est: int = 1
@@ -26,10 +27,6 @@ class RetryBudget:
     def value(self) -> int:
         with self._lock:
             return self._value
-
-    @property
-    def initial(self) -> int:
-        return self._initial
 
     def used(self) -> int:
         with self._lock:
@@ -79,6 +76,8 @@ class StatsCollector:
             "ignored_structures": 0,
             "structure404_page1_retry": 0,
         }
+        self._max_last_modified_ts: Optional[float] = None
+        self._max_last_modified_iso: Optional[str] = None
 
     def incr(self, key: str, value: int = 1) -> None:
         with self._lock:
@@ -88,9 +87,28 @@ class StatsCollector:
         with self._lock:
             self._counters["backoff_seconds"] = self._counters.get("backoff_seconds", 0.0) + float(seconds)
 
-    def snapshot(self) -> Dict[str, float]:
+    def observe_last_modified(self, header_value: Optional[str]) -> None:
+        if not header_value:
+            return
+        try:
+            dt = parsedate_to_datetime(header_value)
+            if dt.tzinfo is None:
+                return
+            ts = dt.timestamp()
+            iso = dt.astimezone().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return
+
         with self._lock:
-            return dict(self._counters)
+            if self._max_last_modified_ts is None or ts > self._max_last_modified_ts:
+                self._max_last_modified_ts = ts
+                self._max_last_modified_iso = iso
+
+    def snapshot(self) -> Dict[str, float | str | None]:
+        with self._lock:
+            out = dict(self._counters)
+            out["max_last_modified"] = self._max_last_modified_iso
+            return out
 
 
 class EsiClient:
@@ -144,10 +162,6 @@ def fetch_entity(
     stats: Optional[StatsCollector] = None,
     polite_delay_s: float = 0.30,
 ) -> Tuple[Optional[int], bool]:
-    """
-    Fetch all pages for one entity, pushing minimal orders via push_orders_fn.
-    Returns: (pages_observed, ignored_flag)
-    """
     pages_observed: Optional[int] = None
     ignored = False
 
@@ -164,6 +178,9 @@ def fetch_entity(
         else:
             tok = token_mgr.current()
             resp = client.get_structure_orders(entity.id, page, tok)
+
+        if stats:
+            stats.observe_last_modified(resp.headers.get("Last-Modified"))
 
         status = resp.status_code
 
