@@ -1,7 +1,7 @@
 {
   "version": 1,
   "status": "completed",
-  "next_run": "2026-03-06T22:46:00Z",
+  "next_run": "2026-03-06T22:58:59Z",
   "failed": 0,
   "current": {
     "max_workers": 12,
@@ -14,23 +14,6 @@
     "ts": "2026-03-06T03:11:49Z"
   },
   "history": [
-    {
-      "ts": "2026-03-06T22:04:01Z",
-      "selected": {
-        "max_workers": 12,
-        "retry_budget": 10
-      },
-      "result": {
-        "ok": true,
-        "ingestSeconds": 220.108361965,
-        "retriesUsed": 0,
-        "http401": 0,
-        "http429": 0,
-        "backoffSeconds": 0.0,
-        "requests": 1797,
-        "score": 220.108361965
-      }
-    },
     {
       "ts": "2026-03-06T22:14:26Z",
       "selected": {
@@ -97,6 +80,23 @@
         "backoffSeconds": 0.0,
         "requests": 1797,
         "score": 189.58140491900002
+      }
+    },
+    {
+      "ts": "2026-03-06T22:54:13Z",
+      "selected": {
+        "max_workers": 12,
+        "retry_budget": 10
+      },
+      "result": {
+        "ok": true,
+        "ingestSeconds": 233.88006316899998,
+        "retriesUsed": 0,
+        "http401": 0,
+        "http429": 0,
+        "backoffSeconds": 0.0,
+        "requests": 1797,
+        "score": 233.88006316899998
       }
     }
   ]
