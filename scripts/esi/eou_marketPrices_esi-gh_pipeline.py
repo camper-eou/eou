@@ -287,8 +287,10 @@ def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: i
     last_score = float(last_result.get("score", 1e18))
 
     recent_pairs = {
-        (int(h.get("selected", {}).get("max_workers", best_workers)),
-         int(h.get("selected", {}).get("retry_budget", best_retry)))
+        (
+            int(h.get("selected", {}).get("max_workers", best_workers)),
+            int(h.get("selected", {}).get("retry_budget", best_retry)),
+        )
         for h in history[-5:]
     }
 
@@ -299,7 +301,6 @@ def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: i
         return (clamp(best_workers - 2, min_workers, max_workers), clamp(best_retry + 5, min_retry, max_retry))
 
     if best_score is not None and last_score > float(best_score):
-        # Si el último empeora, volvemos al best.
         return (clamp(best_workers, min_workers, max_workers), clamp(best_retry, min_retry, max_retry))
 
     if best_score is not None and last_workers == best_workers and int(last_selected.get("retry_budget", best_retry)) == best_retry:
@@ -394,6 +395,11 @@ def update_tuning_state(
     }
 
 
+def write_run_metrics(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
@@ -401,6 +407,7 @@ def main() -> None:
     ap.add_argument("--hubs-out", required=True)
     ap.add_argument("--pages-cache", required=True)
     ap.add_argument("--tuning-state", required=True)
+    ap.add_argument("--run-metrics-path", required=True)
     ap.add_argument("--sheets-id", required=True)
     ap.add_argument("--sheets-range", required=True)
     ap.add_argument("--esi-base", required=True)
@@ -423,6 +430,7 @@ def main() -> None:
     hubs_out_path = Path(args.hubs_out)
     pages_cache_path = Path(args.pages_cache)
     tuning_state_path = Path(args.tuning_state)
+    run_metrics_path = Path(args.run_metrics_path)
 
     tuning_state = load_tuning_state(
         tuning_state_path,
@@ -659,17 +667,94 @@ def main() -> None:
         stats_snapshot = stats.snapshot()
         retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
 
-        new_tuning_state = update_tuning_state(
-            state=tuning_state,
-            selected_workers=selected_workers,
-            selected_retry_budget=selected_retry_budget,
-            ok=ok,
-            ingest_seconds=elapsed,
-            stats=stats_snapshot,
-            retries_used=retries_used,
+        tuning_state = load_tuning_state(
+            tuning_state_path,
+            base_max_workers=int(args.base_max_workers),
+            base_retry_budget=int(args.base_retry_budget),
         )
+
+        from_state = tuning_state
+        ts = _utc_now_iso()
+
+        history_item = {
+            "ts": ts,
+            "selected": {
+                "max_workers": int(selected_workers),
+                "retry_budget": int(selected_retry_budget),
+            },
+            "result": {
+                "ok": bool(ok),
+                "ingestSeconds": float(elapsed),
+                "retriesUsed": int(retries_used),
+                "http401": int(stats_snapshot.get("http401", 0)),
+                "http429": int(stats_snapshot.get("http429", 0)),
+                "backoffSeconds": float(stats_snapshot.get("backoff_seconds", 0.0)),
+                "requests": int(stats_snapshot.get("requests", 0)),
+                "score": compute_score(
+                    ok=ok,
+                    ingest_seconds=elapsed,
+                    http401=int(stats_snapshot.get("http401", 0)),
+                    http429=int(stats_snapshot.get("http429", 0)),
+                    backoff_seconds=float(stats_snapshot.get("backoff_seconds", 0.0)),
+                ),
+            },
+        }
+
+        history = list(from_state.get("history", []))
+        history.append(history_item)
+        history = history[-5:]
+
+        best = dict(from_state.get("best", {}))
+        this_score = history_item["result"]["score"]
+        if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
+            best = {
+                "max_workers": int(selected_workers),
+                "retry_budget": int(selected_retry_budget),
+                "score": float(this_score),
+                "ts": ts,
+            }
+
+        temp_state = {
+            **from_state,
+            "history": history,
+            "best": best,
+            "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
+        }
+
+        next_workers, next_retry_budget = choose_tuned_parameters(
+            temp_state,
+            base_workers=selected_workers,
+            base_retry_budget=selected_retry_budget,
+        )
+
+        new_tuning_state = {
+            "version": int(from_state.get("version", 1)),
+            "status": from_state.get("status", "in progress"),
+            "next_run": from_state.get("next_run"),
+            "failed": int(from_state.get("failed", 0)),
+            "current": {
+                "max_workers": int(next_workers),
+                "retry_budget": int(next_retry_budget),
+            },
+            "best": best,
+            "history": history,
+        }
+
         write_tuning_state(tuning_state_path, new_tuning_state)
+        write_run_metrics(
+            run_metrics_path,
+            {
+                "ts": ts,
+                "selected": {
+                    "max_workers": int(selected_workers),
+                    "retry_budget": int(selected_retry_budget),
+                },
+                "result": history_item["result"],
+                "next_current": new_tuning_state["current"],
+            },
+        )
         LOG.info("Wrote tuning state to %s", tuning_state_path)
+        LOG.info("Wrote run metrics to %s", run_metrics_path)
 
 
 if __name__ == "__main__":
