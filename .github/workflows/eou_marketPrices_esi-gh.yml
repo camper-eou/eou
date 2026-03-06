@@ -57,7 +57,6 @@ jobs:
       ESI_USER_AGENT: "eou-market-prices/1.0 (+https://github.com/camper-eou/eou)"
 
       RUN_METRICS_PATH: .tmp/eou_marketPrices_esi-gh_run_metrics.json
-      FINALIZE_SUMMARY_PATH: .tmp/eou_marketPrices_esi-gh_finalize_summary.json
 
     steps:
       - name: Checkout (camper-eou/eou)
@@ -192,7 +191,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" "${RUN_METRICS_PATH}" "${FINALIZE_SUMMARY_PATH}" || true
+          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
           if git diff --cached --quiet; then
             echo "No camper state changes."
             exit 0
