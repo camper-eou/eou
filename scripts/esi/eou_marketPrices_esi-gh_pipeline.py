@@ -9,6 +9,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -18,25 +19,13 @@ LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
 
 
 def _load_module(module_tag: str):
-    """
-    Carga un módulo hermano cuyo nombre de fichero contiene '-',
-    por lo que no es importable con 'import' normal.
-
-    IMPORTANTÍSIMO:
-    Insertamos el módulo en sys.modules ANTES de exec_module
-    para que dataclasses y typing puedan resolver cls.__module__.
-    """
     filename = BASE_DIR / f"eou_marketPrices_esi-gh_{module_tag}.py"
-    mod_name = f"eou_marketPrices_esi_gh_{module_tag}"  # sin '-' para sys.modules
+    mod_name = f"eou_marketPrices_esi_gh_{module_tag}"
     spec = importlib.util.spec_from_file_location(mod_name, filename)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module from {filename}")
-
     mod = importlib.util.module_from_spec(spec)
-
-    # ✅ FIX: registrar en sys.modules antes de ejecutar
     sys.modules[spec.name] = mod
-
     spec.loader.exec_module(mod)
     return mod
 
@@ -46,12 +35,14 @@ metrics_mod = _load_module("metrics")
 sde_mod = _load_module("sde")
 sheets_mod = _load_module("sheets")
 sqlite_mod = _load_module("sqlite")
+tuning_mod = _load_module("tuning")
 types_mod = _load_module("types")
 
 Entity = fetch_mod.Entity
 EsiClient = fetch_mod.EsiClient
 RetryBudget = fetch_mod.RetryBudget
 TokenManager = fetch_mod.TokenManager
+FetchStats = fetch_mod.FetchStats
 fetch_entity = fetch_mod.fetch_entity
 
 compute_buy = metrics_mod.compute_buy
@@ -65,6 +56,9 @@ read_tokens_from_sheet = sheets_mod.read_tokens_from_sheet
 
 OrdersWriter = sqlite_mod.OrdersWriter
 connect = sqlite_mod.connect
+
+choose_params = tuning_mod.choose_params
+update_tuning_state = tuning_mod.update_tuning_state
 
 detect_types_file = types_mod.detect_types_file
 load_types = types_mod.load_types
@@ -231,13 +225,14 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--hubs-out", required=True)
     ap.add_argument("--pages-cache", required=True)
+    ap.add_argument("--tuning-state", required=True)
     ap.add_argument("--sheets-id", required=True)
     ap.add_argument("--sheets-range", required=True)
     ap.add_argument("--esi-base", required=True)
     ap.add_argument("--datasource", required=True)
     ap.add_argument("--user-agent", required=True)
-    ap.add_argument("--max-workers", type=int, default=10)
-    ap.add_argument("--retry-budget", type=int, default=10)
+    ap.add_argument("--max-workers", type=int, default=0)
+    ap.add_argument("--retry-budget", type=int, default=0)
     ap.add_argument("--force-refresh", action="store_true")
     args = ap.parse_args()
 
@@ -247,211 +242,256 @@ def main() -> None:
     out_path = Path(args.out)
     hubs_out_path = Path(args.hubs_out)
     pages_cache_path = Path(args.pages_cache)
+    tuning_state_path = Path(args.tuning_state)
 
-    LOG.info("Loading inputs from landu repo at %s", landu_root)
+    workers, retry_budget_value, previous_tuning_state = choose_params(
+        tuning_state_path,
+        override_workers=args.max_workers,
+        override_retry_budget=args.retry_budget,
+    )
 
-    types_path = detect_types_file(landu_root)
-    types = load_types(types_path)
-    regions = load_regions(landu_root)
+    LOG.info("Effective params: max_workers=%s retry_budget=%s", workers, retry_budget_value)
 
-    stations_map = load_stations_map(landu_root)
-    structures_map = load_structures_map(landu_root)
-    location_names = {**stations_map, **structures_map}
+    start_ts = time.monotonic()
+    fetch_stats = FetchStats()
 
-    LOG.info("Reading structure access tokens from Google Sheets (range %s)", args.sheets_range)
-    tokens = read_tokens_from_sheet(args.sheets_id, args.sheets_range)
-    if not tokens:
-        raise SystemExit("No tokens returned from Google Sheets.")
-    token_mgr = TokenManager(tokens)
+    ok = False
+    total_orders = 0
 
-    cache = None if args.force_refresh else load_pages_cache(pages_cache_path)
-    LOG.info("Pages cache: %s", "enabled" if cache else "disabled")
+    try:
+        LOG.info("Loading inputs from landu repo at %s", landu_root)
 
-    entities: List[Entity] = []
-    for r in regions:
-        est = cache.stations.get(r.region_id, 1) if cache else 1
-        entities.append(Entity(kind="region", id=r.region_id, name=r.region_name, pages_est=est))
+        types_path = detect_types_file(landu_root)
+        types = load_types(types_path)
+        regions = load_regions(landu_root)
 
-    for sid, sname in structures_map.items():
-        est = cache.structures.get(sid, 1) if cache else 1
-        entities.append(Entity(kind="structure", id=sid, name=sname, pages_est=est))
+        stations_map = load_stations_map(landu_root)
+        structures_map = load_structures_map(landu_root)
+        location_names = {**stations_map, **structures_map}
 
-    workers = max(1, int(args.max_workers))
-    bins = greedy_balance(entities, workers)
-    LOG.info("Planned %d entities across %d workers", len(entities), workers)
+        LOG.info("Reading structure access tokens from Google Sheets (range %s)", args.sheets_range)
+        tokens = read_tokens_from_sheet(args.sheets_id, args.sheets_range)
+        if not tokens:
+            raise SystemExit("No tokens returned from Google Sheets.")
+        token_mgr = TokenManager(tokens)
 
-    retry_budget = RetryBudget(args.retry_budget)
-    client = EsiClient(base=args.esi_base, datasource=args.datasource, user_agent=args.user_agent)
+        cache = None if args.force_refresh else load_pages_cache(pages_cache_path)
+        LOG.info("Pages cache: %s", "enabled" if cache else "disabled")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="eou_marketPrices_esi_gh_"))
-    db_path = tmpdir / "orders.sqlite"
+        entities: List[Entity] = []
+        for r in regions:
+            est = cache.stations.get(r.region_id, 1) if cache else 1
+            entities.append(Entity(kind="region", id=r.region_id, name=r.region_name, pages_est=est))
 
-    writer = OrdersWriter(db_path)
-    writer.start()
+        for sid, sname in structures_map.items():
+            est = cache.structures.get(sid, 1) if cache else 1
+            entities.append(Entity(kind="structure", id=sid, name=sname, pages_est=est))
 
-    observed_regions: Dict[int, int] = {}
-    observed_structs: Dict[int, int] = {}
-    ignored_structs: set[int] = set()
+        bins = greedy_balance(entities, workers)
+        LOG.info("Planned %d entities across %d workers", len(entities), workers)
 
-    def push_orders(batch):
-        writer.push(batch)
+        retry_budget = RetryBudget(retry_budget_value)
+        client = EsiClient(base=args.esi_base, datasource=args.datasource, user_agent=args.user_agent)
 
-    def worker_fn(my_entities: List[Entity]) -> None:
-        for ent in my_entities:
-            pages, ignored = fetch_entity(
-                ent,
-                client=client,
-                token_mgr=token_mgr,
-                retry_budget=retry_budget,
-                push_orders_fn=push_orders,
-                polite_delay_s=0.30,
-            )
-            pages = int(pages or 1)
-            if ent.kind == "region":
-                observed_regions[ent.id] = pages
-            else:
-                if ignored:
-                    ignored_structs.add(ent.id)
+        tmpdir = Path(tempfile.mkdtemp(prefix="eou_marketPrices_esi_gh_"))
+        db_path = tmpdir / "orders.sqlite"
+
+        writer = OrdersWriter(db_path)
+        writer.start()
+
+        observed_regions: Dict[int, int] = {}
+        observed_structs: Dict[int, int] = {}
+        ignored_structs: set[int] = set()
+
+        def push_orders(batch):
+            writer.push(batch)
+
+        def worker_fn(my_entities: List[Entity]) -> None:
+            for ent in my_entities:
+                pages, ignored = fetch_entity(
+                    ent,
+                    client=client,
+                    token_mgr=token_mgr,
+                    retry_budget=retry_budget,
+                    push_orders_fn=push_orders,
+                    stats=fetch_stats,
+                    polite_delay_s=0.30,
+                )
+                pages = int(pages or 1)
+                if ent.kind == "region":
+                    observed_regions[ent.id] = pages
                 else:
-                    observed_structs[ent.id] = pages
+                    if ignored:
+                        ignored_structs.add(ent.id)
+                    else:
+                        observed_structs[ent.id] = pages
 
-    LOG.info("Starting ingestion")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(worker_fn, b) for b in bins if b]
-        for f in concurrent.futures.as_completed(futs):
-            f.result()
+        LOG.info("Starting ingestion")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(worker_fn, b) for b in bins if b]
+            for f in concurrent.futures.as_completed(futs):
+                f.result()
 
-    writer.stop()
-    LOG.info("Ingestion complete; DB at %s", db_path)
+        writer.stop()
+        LOG.info("Ingestion complete; DB at %s", db_path)
 
-    conn = connect(db_path)
+        conn = connect(db_path)
 
-    total_orders, hubs = compute_hubs(conn, location_names)
-    LOG.info("Hubs passing 1.75%% threshold: %d", len(hubs))
+        total_orders, hubs = compute_hubs(conn, location_names)
+        LOG.info("Hubs passing 1.75%% threshold: %d", len(hubs))
 
-    conn.execute("DROP TABLE IF EXISTS hubs;")
-    conn.execute("CREATE TEMP TABLE hubs (location_id INTEGER PRIMARY KEY, rank INTEGER NOT NULL, name TEXT NOT NULL);")
-    for rank, hub in enumerate(hubs, start=1):
+        conn.execute("DROP TABLE IF EXISTS hubs;")
+        conn.execute("CREATE TEMP TABLE hubs (location_id INTEGER PRIMARY KEY, rank INTEGER NOT NULL, name TEXT NOT NULL);")
+        for rank, hub in enumerate(hubs, start=1):
+            conn.execute(
+                "INSERT INTO hubs(location_id, rank, name) VALUES (?,?,?)",
+                (int(hub["stationID"]), int(rank), str(hub["station"])),
+            )
+        conn.commit()
+
+        conn.execute("DROP TABLE IF EXISTS universe_buy;")
         conn.execute(
-            "INSERT INTO hubs(location_id, rank, name) VALUES (?,?,?)",
-            (int(hub["stationID"]), int(rank), str(hub["station"])),
+            """
+            CREATE TEMP TABLE universe_buy AS
+            SELECT type_id, price, SUM(volume_remain) AS vol
+            FROM orders WHERE is_buy=1
+            GROUP BY type_id, price
+            ORDER BY type_id ASC, price DESC;
+            """
         )
-    conn.commit()
+        conn.execute("DROP TABLE IF EXISTS universe_sell;")
+        conn.execute(
+            """
+            CREATE TEMP TABLE universe_sell AS
+            SELECT type_id, price, SUM(volume_remain) AS vol
+            FROM orders WHERE is_buy=0
+            GROUP BY type_id, price
+            ORDER BY type_id ASC, price ASC;
+            """
+        )
 
-    conn.execute("DROP TABLE IF EXISTS universe_buy;")
-    conn.execute(
-        """
-        CREATE TEMP TABLE universe_buy AS
-        SELECT type_id, price, SUM(volume_remain) AS vol
-        FROM orders WHERE is_buy=1
-        GROUP BY type_id, price
-        ORDER BY type_id ASC, price DESC;
-        """
-    )
-    conn.execute("DROP TABLE IF EXISTS universe_sell;")
-    conn.execute(
-        """
-        CREATE TEMP TABLE universe_sell AS
-        SELECT type_id, price, SUM(volume_remain) AS vol
-        FROM orders WHERE is_buy=0
-        GROUP BY type_id, price
-        ORDER BY type_id ASC, price ASC;
-        """
-    )
+        conn.execute("DROP TABLE IF EXISTS hubs_buy;")
+        conn.execute(
+            """
+            CREATE TEMP TABLE hubs_buy AS
+            SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
+            FROM orders o
+            JOIN hubs h ON h.location_id = o.location_id
+            WHERE o.is_buy=1
+            GROUP BY o.type_id, o.location_id, o.price
+            ORDER BY o.type_id ASC, o.location_id ASC, o.price DESC;
+            """
+        )
+        conn.execute("DROP TABLE IF EXISTS hubs_sell;")
+        conn.execute(
+            """
+            CREATE TEMP TABLE hubs_sell AS
+            SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
+            FROM orders o
+            JOIN hubs h ON h.location_id = o.location_id
+            WHERE o.is_buy=0
+            GROUP BY o.type_id, o.location_id, o.price
+            ORDER BY o.type_id ASC, o.location_id ASC, o.price ASC;
+            """
+        )
+        conn.commit()
 
-    conn.execute("DROP TABLE IF EXISTS hubs_buy;")
-    conn.execute(
-        """
-        CREATE TEMP TABLE hubs_buy AS
-        SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
-        FROM orders o
-        JOIN hubs h ON h.location_id = o.location_id
-        WHERE o.is_buy=1
-        GROUP BY o.type_id, o.location_id, o.price
-        ORDER BY o.type_id ASC, o.location_id ASC, o.price DESC;
-        """
-    )
-    conn.execute("DROP TABLE IF EXISTS hubs_sell;")
-    conn.execute(
-        """
-        CREATE TEMP TABLE hubs_sell AS
-        SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
-        FROM orders o
-        JOIN hubs h ON h.location_id = o.location_id
-        WHERE o.is_buy=0
-        GROUP BY o.type_id, o.location_id, o.price
-        ORDER BY o.type_id ASC, o.location_id ASC, o.price ASC;
-        """
-    )
-    conn.commit()
+        ub_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_buy ORDER BY type_id, price DESC;"))
+        us_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_sell ORDER BY type_id, price ASC;"))
+        hb_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_buy ORDER BY type_id, location_id, price DESC;"))
+        hs_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_sell ORDER BY type_id, location_id, price ASC;"))
 
-    ub_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_buy ORDER BY type_id, price DESC;"))
-    us_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_sell ORDER BY type_id, price ASC;"))
-    hb_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_buy ORDER BY type_id, location_id, price DESC;"))
-    hs_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_sell ORDER BY type_id, location_id, price ASC;"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        LOG.info("Writing NDJSON.gz to %s", out_path)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    LOG.info("Writing NDJSON.gz to %s", out_path)
+        with gzip.open(out_path, "wt", encoding="utf-8") as gz:
+            for t in types:
+                tid = int(t.type_id)
 
-    with gzip.open(out_path, "wt", encoding="utf-8") as gz:
-        for t in types:
-            tid = int(t.type_id)
+                ub_rows = ub_stream.take_for_type(tid)
+                us_rows = us_stream.take_for_type(tid)
+                buy_univ = [(float(r[1]), int(r[2])) for r in ub_rows]
+                sell_univ = [(float(r[1]), int(r[2])) for r in us_rows]
 
-            ub_rows = ub_stream.take_for_type(tid)
-            us_rows = us_stream.take_for_type(tid)
-            buy_univ = [(float(r[1]), int(r[2])) for r in ub_rows]
-            sell_univ = [(float(r[1]), int(r[2])) for r in us_rows]
+                hb_rows = hb_stream.take_for_type(tid)
+                hs_rows = hs_stream.take_for_type(tid)
 
-            hb_rows = hb_stream.take_for_type(tid)
-            hs_rows = hs_stream.take_for_type(tid)
+                buy_by_loc: Dict[int, List[Tuple[float, int]]] = {}
+                sell_by_loc: Dict[int, List[Tuple[float, int]]] = {}
 
-            buy_by_loc: Dict[int, List[Tuple[float, int]]] = {}
-            sell_by_loc: Dict[int, List[Tuple[float, int]]] = {}
+                for r in hb_rows:
+                    loc = int(r[1])
+                    buy_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
 
-            for r in hb_rows:
-                loc = int(r[1])
-                buy_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
+                for r in hs_rows:
+                    loc = int(r[1])
+                    sell_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
 
-            for r in hs_rows:
-                loc = int(r[1])
-                sell_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
+                buy_hubs_all: List[Tuple[float, int]] = []
+                sell_hubs_all: List[Tuple[float, int]] = []
+                for lst in buy_by_loc.values():
+                    buy_hubs_all.extend(lst)
+                for lst in sell_by_loc.values():
+                    sell_hubs_all.extend(lst)
 
-            buy_hubs_all: List[Tuple[float, int]] = []
-            sell_hubs_all: List[Tuple[float, int]] = []
-            for lst in buy_by_loc.values():
-                buy_hubs_all.extend(lst)
-            for lst in sell_by_loc.values():
-                sell_hubs_all.extend(lst)
+                prices = [
+                    build_segment_entry(0, "universe", buy_univ, sell_univ),
+                    build_segment_entry(None, "hubs", buy_hubs_all, sell_hubs_all),
+                ]
 
-            prices = [
-                build_segment_entry(0, "universe", buy_univ, sell_univ),
-                build_segment_entry(None, "hubs", buy_hubs_all, sell_hubs_all),
-            ]
+                for hub in hubs:
+                    loc = int(hub["stationID"])
+                    name = str(hub["station"])
+                    prices.append(build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, [])))
 
-            for hub in hubs:
-                loc = int(hub["stationID"])
-                name = str(hub["station"])
-                prices.append(build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, [])))
+                gz.write(json.dumps({"typeID": tid, "type": t.type_name, "prices": prices},
+                                    ensure_ascii=False, separators=(",", ":")) + "\n")
 
-            gz.write(json.dumps({"typeID": tid, "type": t.type_name, "prices": prices},
-                                ensure_ascii=False, separators=(",", ":")) + "\n")
+        write_hubs_json(hubs_out_path, total_orders, hubs)
+        LOG.info("Wrote hubs json to %s", hubs_out_path)
 
-    write_hubs_json(hubs_out_path, total_orders, hubs)
-    LOG.info("Wrote hubs json to %s", hubs_out_path)
+        regions_cache_rows = [(r.region_id, r.region_name, int(observed_regions.get(r.region_id, 1))) for r in regions]
+        structs_cache_rows = []
+        for sid, sname in structures_map.items():
+            if sid in ignored_structs:
+                continue
+            structs_cache_rows.append((sid, sname, int(observed_structs.get(sid, 1))))
 
-    regions_cache_rows = [(r.region_id, r.region_name, int(observed_regions.get(r.region_id, 1))) for r in regions]
-    structs_cache_rows = []
-    for sid, sname in structures_map.items():
-        if sid in ignored_structs:
-            continue
-        structs_cache_rows.append((sid, sname, int(observed_structs.get(sid, 1))))
+        write_pages_cache(pages_cache_path, regions_cache_rows, structs_cache_rows)
+        LOG.info("Wrote pages cache to %s", pages_cache_path)
 
-    write_pages_cache(pages_cache_path, regions_cache_rows, structs_cache_rows)
-    LOG.info("Wrote pages cache to %s", pages_cache_path)
+        conn.close()
+        ok = True
+        LOG.info("Done.")
 
-    conn.close()
-    LOG.info("Done.")
+    finally:
+        ingest_seconds = round(time.monotonic() - start_ts, 3)
+        stats_snapshot = fetch_stats.snapshot()
+        retries_used = max(0, retry_budget_value - stats_snapshot.get("http401", 0))  # overwritten below
 
+        # retries usados reales desde el fusible
+        # si el pipeline falló antes de crear RetryBudget, usamos 0
+        try:
+            # variable local puede no existir si rompió muy pronto
+            retries_used = int(retry_budget.initial - retry_budget.value)  # type: ignore[name-defined]
+        except Exception:
+            retries_used = 0
 
-if __name__ == "__main__":
-    main()
+        run_metrics = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "max_workers": int(workers),
+            "retry_budget": int(retry_budget_value),
+            "ingestSeconds": float(ingest_seconds),
+            "retriesUsed": int(retries_used),
+            "ok": bool(ok),
+            "totalOrders": int(total_orders),
+            **stats_snapshot,
+        }
+
+        update_tuning_state(
+            tuning_state_path,
+            previous_tuning_state,
+            run_metrics,
+            override_workers=args.max_workers,
+            override_retry_budget=args.retry_budget,
+        )
