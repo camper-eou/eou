@@ -148,6 +148,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
 
+          # Guardamos cambios locales antes de sincronizar
           if [[ -n "$(git status --porcelain)" ]]; then
             git stash push -u -m "ci: stash before pull"
           fi
@@ -165,7 +166,25 @@ jobs:
           fi
 
           git commit -m "EOU: update marketPices.json.gz + hubs.json"
-          git push origin "${LANDU_REF}"
+
+          # Reintento conservador por si otro workflow empuja entre nuestro pull y push
+          pushed=0
+          for attempt in 1 2 3; do
+            echo "Push attempt ${attempt}/3"
+
+            if git push origin "${LANDU_REF}"; then
+              pushed=1
+              break
+            fi
+
+            echo "Push rejected, trying pull --rebase and retry..."
+            git pull --rebase origin "${LANDU_REF}"
+          done
+
+          if [[ "${pushed}" -ne 1 ]]; then
+            echo "Failed to push after 3 attempts."
+            exit 1
+          fi
 
       - name: Finalize tuning state (completed)
         if: always() && steps.commit_landu.outcome == 'success'
