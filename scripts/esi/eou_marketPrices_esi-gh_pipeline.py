@@ -11,11 +11,16 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _load_module(module_tag: str):
@@ -24,6 +29,7 @@ def _load_module(module_tag: str):
     spec = importlib.util.spec_from_file_location(mod_name, filename)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module from {filename}")
+
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -35,14 +41,13 @@ metrics_mod = _load_module("metrics")
 sde_mod = _load_module("sde")
 sheets_mod = _load_module("sheets")
 sqlite_mod = _load_module("sqlite")
-tuning_mod = _load_module("tuning")
 types_mod = _load_module("types")
 
 Entity = fetch_mod.Entity
 EsiClient = fetch_mod.EsiClient
 RetryBudget = fetch_mod.RetryBudget
 TokenManager = fetch_mod.TokenManager
-FetchStats = fetch_mod.FetchStats
+StatsCollector = fetch_mod.StatsCollector
 fetch_entity = fetch_mod.fetch_entity
 
 compute_buy = metrics_mod.compute_buy
@@ -56,9 +61,6 @@ read_tokens_from_sheet = sheets_mod.read_tokens_from_sheet
 
 OrdersWriter = sqlite_mod.OrdersWriter
 connect = sqlite_mod.connect
-
-choose_params = tuning_mod.choose_params
-update_tuning_state = tuning_mod.update_tuning_state
 
 detect_types_file = types_mod.detect_types_file
 load_types = types_mod.load_types
@@ -116,7 +118,7 @@ def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]
     if total_orders <= 0:
         return 0, []
 
-    threshold = total_orders * 0.0175  # 1.75%
+    threshold = total_orders * 0.0175
 
     rows = conn.execute(
         """
@@ -219,6 +221,150 @@ def write_hubs_json(path: Path, total_orders: int, hubs: List[Dict]) -> None:
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_tuning_state(path: Path) -> Dict:
+    if not path.exists():
+        return {
+            "version": 1,
+            "current": {"max_workers": 10, "retry_budget": 10},
+            "best": {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None},
+            "history": [],
+        }
+
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    obj.setdefault("version", 1)
+    obj.setdefault("current", {"max_workers": 10, "retry_budget": 10})
+    obj.setdefault("best", {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None})
+    obj.setdefault("history", [])
+    return obj
+
+
+def clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: int) -> Tuple[int, int]:
+    min_workers, max_workers = 4, 16
+    min_retry, max_retry = 10, 50
+
+    current = state.get("current") or {}
+    history = state.get("history") or []
+
+    workers = int(current.get("max_workers", base_workers))
+    retry_budget = int(current.get("retry_budget", base_retry_budget))
+
+    if not history:
+        return clamp(workers, min_workers, max_workers), clamp(retry_budget, min_retry, max_retry)
+
+    last = history[-1]
+    result = last.get("result", {})
+
+    last_ok = bool(result.get("ok", False))
+    last_429 = int(result.get("http429", 0))
+    last_backoff = float(result.get("backoffSeconds", 0.0))
+    last_retries = int(result.get("retriesUsed", 0))
+    last_budget = int(last.get("selected", {}).get("retry_budget", retry_budget))
+
+    if not last_ok:
+        workers -= 2
+        retry_budget += 5
+    elif last_429 > 0 or last_backoff > 120 or (last_budget > 0 and last_retries >= int(last_budget * 0.8)):
+        workers -= 2
+        retry_budget += 5
+    elif last_429 == 0 and last_backoff < 30 and last_retries <= 2:
+        workers += 1
+        retry_budget -= 5
+
+    workers = clamp(workers, min_workers, max_workers)
+    retry_budget = clamp(retry_budget, min_retry, max_retry)
+    return workers, retry_budget
+
+
+def compute_score(ok: bool, ingest_seconds: float, retries_used: int, http401: int, http429: int, backoff_seconds: float) -> float:
+    score = float(ingest_seconds)
+    score += 15.0 * float(http429)
+    score += 5.0 * float(http401)
+    score += 0.5 * float(backoff_seconds)
+    if not ok:
+        score += 300.0
+    return score
+
+
+def update_tuning_state(
+    state: Dict,
+    selected_workers: int,
+    selected_retry_budget: int,
+    ok: bool,
+    ingest_seconds: float,
+    stats: Dict[str, float],
+    retries_used: int,
+) -> Dict:
+    ts = _utc_now_iso()
+
+    history_item = {
+        "ts": ts,
+        "selected": {
+            "max_workers": int(selected_workers),
+            "retry_budget": int(selected_retry_budget),
+        },
+        "result": {
+            "ok": bool(ok),
+            "ingestSeconds": float(ingest_seconds),
+            "retriesUsed": int(retries_used),
+            "http401": int(stats.get("http401", 0)),
+            "http429": int(stats.get("http429", 0)),
+            "backoffSeconds": float(stats.get("backoff_seconds", 0.0)),
+            "requests": int(stats.get("requests", 0)),
+            "score": compute_score(
+                ok=ok,
+                ingest_seconds=ingest_seconds,
+                retries_used=retries_used,
+                http401=int(stats.get("http401", 0)),
+                http429=int(stats.get("http429", 0)),
+                backoff_seconds=float(stats.get("backoff_seconds", 0.0)),
+            ),
+        },
+    }
+
+    history = state.get("history", [])
+    history.append(history_item)
+    history = history[-5:]  # solo 5 últimos runs
+
+    next_workers, next_retry_budget = choose_tuned_parameters(
+        {
+            **state,
+            "history": history,
+            "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
+        },
+        base_workers=selected_workers,
+        base_retry_budget=selected_retry_budget,
+    )
+
+    best = state.get("best", {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None})
+    this_score = history_item["result"]["score"]
+    if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
+        best = {
+            "max_workers": int(selected_workers),
+            "retry_budget": int(selected_retry_budget),
+            "score": float(this_score),
+            "ts": ts,
+        }
+
+    return {
+        "version": 1,
+        "current": {
+            "max_workers": int(next_workers),
+            "retry_budget": int(next_retry_budget),
+        },
+        "best": best,
+        "history": history,
+    }
+
+
+def write_tuning_state(path: Path, state: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
@@ -231,12 +377,17 @@ def main() -> None:
     ap.add_argument("--esi-base", required=True)
     ap.add_argument("--datasource", required=True)
     ap.add_argument("--user-agent", required=True)
-    ap.add_argument("--max-workers", type=int, default=0)
-    ap.add_argument("--retry-budget", type=int, default=0)
+    ap.add_argument("--base-max-workers", type=int, default=10)
+    ap.add_argument("--base-retry-budget", type=int, default=10)
     ap.add_argument("--force-refresh", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    start_ts = time.perf_counter()
+    ok = False
+    stats = StatsCollector()
+    retry_budget_obj: RetryBudget | None = None
 
     landu_root = Path(args.landu_root)
     out_path = Path(args.out)
@@ -244,19 +395,18 @@ def main() -> None:
     pages_cache_path = Path(args.pages_cache)
     tuning_state_path = Path(args.tuning_state)
 
-    workers, retry_budget_value, previous_tuning_state = choose_params(
-        tuning_state_path,
-        override_workers=args.max_workers,
-        override_retry_budget=args.retry_budget,
+    tuning_state = load_tuning_state(tuning_state_path)
+    selected_workers, selected_retry_budget = choose_tuned_parameters(
+        tuning_state,
+        base_workers=int(args.base_max_workers),
+        base_retry_budget=int(args.base_retry_budget),
     )
 
-    LOG.info("Effective params: max_workers=%s retry_budget=%s", workers, retry_budget_value)
-
-    start_ts = time.monotonic()
-    fetch_stats = FetchStats()
-
-    ok = False
-    total_orders = 0
+    LOG.info(
+        "Autotuning selected max_workers=%s retry_budget=%s",
+        selected_workers,
+        selected_retry_budget,
+    )
 
     try:
         LOG.info("Loading inputs from landu repo at %s", landu_root)
@@ -287,10 +437,10 @@ def main() -> None:
             est = cache.structures.get(sid, 1) if cache else 1
             entities.append(Entity(kind="structure", id=sid, name=sname, pages_est=est))
 
-        bins = greedy_balance(entities, workers)
-        LOG.info("Planned %d entities across %d workers", len(entities), workers)
+        bins = greedy_balance(entities, selected_workers)
+        LOG.info("Planned %d entities across %d workers", len(entities), selected_workers)
 
-        retry_budget = RetryBudget(retry_budget_value)
+        retry_budget_obj = RetryBudget(selected_retry_budget)
         client = EsiClient(base=args.esi_base, datasource=args.datasource, user_agent=args.user_agent)
 
         tmpdir = Path(tempfile.mkdtemp(prefix="eou_marketPrices_esi_gh_"))
@@ -312,9 +462,9 @@ def main() -> None:
                     ent,
                     client=client,
                     token_mgr=token_mgr,
-                    retry_budget=retry_budget,
+                    retry_budget=retry_budget_obj,
                     push_orders_fn=push_orders,
-                    stats=fetch_stats,
+                    stats=stats,
                     polite_delay_s=0.30,
                 )
                 pages = int(pages or 1)
@@ -327,7 +477,7 @@ def main() -> None:
                         observed_structs[ent.id] = pages
 
         LOG.info("Starting ingestion")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=selected_workers) as ex:
             futs = [ex.submit(worker_fn, b) for b in bins if b]
             for f in concurrent.futures.as_completed(futs):
                 f.result()
@@ -444,8 +594,14 @@ def main() -> None:
                     name = str(hub["station"])
                     prices.append(build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, [])))
 
-                gz.write(json.dumps({"typeID": tid, "type": t.type_name, "prices": prices},
-                                    ensure_ascii=False, separators=(",", ":")) + "\n")
+                gz.write(
+                    json.dumps(
+                        {"typeID": tid, "type": t.type_name, "prices": prices},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
 
         write_hubs_json(hubs_out_path, total_orders, hubs)
         LOG.info("Wrote hubs json to %s", hubs_out_path)
@@ -465,33 +621,22 @@ def main() -> None:
         LOG.info("Done.")
 
     finally:
-        ingest_seconds = round(time.monotonic() - start_ts, 3)
-        stats_snapshot = fetch_stats.snapshot()
-        retries_used = max(0, retry_budget_value - stats_snapshot.get("http401", 0))  # overwritten below
+        elapsed = time.perf_counter() - start_ts
+        stats_snapshot = stats.snapshot()
+        retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
 
-        # retries usados reales desde el fusible
-        # si el pipeline falló antes de crear RetryBudget, usamos 0
-        try:
-            # variable local puede no existir si rompió muy pronto
-            retries_used = int(retry_budget.initial - retry_budget.value)  # type: ignore[name-defined]
-        except Exception:
-            retries_used = 0
-
-        run_metrics = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "max_workers": int(workers),
-            "retry_budget": int(retry_budget_value),
-            "ingestSeconds": float(ingest_seconds),
-            "retriesUsed": int(retries_used),
-            "ok": bool(ok),
-            "totalOrders": int(total_orders),
-            **stats_snapshot,
-        }
-
-        update_tuning_state(
-            tuning_state_path,
-            previous_tuning_state,
-            run_metrics,
-            override_workers=args.max_workers,
-            override_retry_budget=args.retry_budget,
+        new_tuning_state = update_tuning_state(
+            state=tuning_state,
+            selected_workers=selected_workers,
+            selected_retry_budget=selected_retry_budget,
+            ok=ok,
+            ingest_seconds=elapsed,
+            stats=stats_snapshot,
+            retries_used=retries_used,
         )
+        write_tuning_state(tuning_state_path, new_tuning_state)
+        LOG.info("Wrote tuning state to %s", tuning_state_path)
+
+
+if __name__ == "__main__":
+    main()
