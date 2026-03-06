@@ -9,15 +9,15 @@ on:
         type: boolean
         default: false
       max_workers:
-        description: "0 = autotune; >0 = override manual"
+        description: "Valor base de workers internos para autotuning"
         required: false
         type: number
-        default: 0
+        default: 10
       retry_budget:
-        description: "0 = autotune; >0 = override manual"
+        description: "Valor base de retry_budget para autotuning"
         required: false
         type: number
-        default: 0
+        default: 10
 
 concurrency:
   group: eou_marketPrices_esi_gh
@@ -97,8 +97,8 @@ jobs:
       - name: Run pipeline (fetch → dedupe → compute → write gz/json)
         env:
           FORCE_REFRESH: ${{ inputs.force_refresh }}
-          MAX_WORKERS: ${{ inputs.max_workers }}
-          RETRY_BUDGET: ${{ inputs.retry_budget }}
+          BASE_MAX_WORKERS: ${{ inputs.max_workers }}
+          BASE_RETRY_BUDGET: ${{ inputs.retry_budget }}
         run: |
           set -euo pipefail
 
@@ -113,11 +113,11 @@ jobs:
             --esi-base "${ESI_BASE}" \
             --datasource "${ESI_DATASOURCE}" \
             --user-agent "${ESI_USER_AGENT}" \
-            --max-workers "${MAX_WORKERS}" \
-            --retry-budget "${RETRY_BUDGET}" \
+            --base-max-workers "${BASE_MAX_WORKERS}" \
+            --base-retry-budget "${BASE_RETRY_BUDGET}" \
             $( [ "${FORCE_REFRESH}" = "true" ] && echo "--force-refresh" )
 
-      - name: Commit pages cache + tuning state (camper-eou/eou)
+      - name: Commit camper states (pages + tuning)
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -129,7 +129,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "EOU: update market prices state"
+          git commit -m "EOU: update market prices states"
           git push
 
       - name: Commit marketPices.json.gz + hubs.json (landu-eou/eou)
