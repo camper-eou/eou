@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
 
@@ -18,8 +18,8 @@ class Entity:
 
 class RetryBudget:
     def __init__(self, initial: int):
-        self._value = int(initial)
         self._initial = int(initial)
+        self._value = int(initial)
         self._lock = Lock()
 
     @property
@@ -30,6 +30,10 @@ class RetryBudget:
     @property
     def initial(self) -> int:
         return self._initial
+
+    def used(self) -> int:
+        with self._lock:
+            return self._initial - self._value
 
     def consume(self, reason: str) -> None:
         with self._lock:
@@ -60,46 +64,33 @@ class TokenManager:
                 raise RuntimeError("All ESI access tokens exhausted (cannot access structures).")
 
 
-@dataclass
-class FetchStats:
-    requests: int = 0
-    http401: int = 0
-    http404: int = 0
-    http420: int = 0
-    http429: int = 0
-    http5xx: int = 0
-    backoff_seconds: float = 0.0
-    _lock: Lock = field(default_factory=Lock, repr=False)
+class StatsCollector:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._counters: Dict[str, float] = {
+            "requests": 0,
+            "http200": 0,
+            "http401": 0,
+            "http404": 0,
+            "http420": 0,
+            "http429": 0,
+            "http5xx": 0,
+            "backoff_seconds": 0.0,
+            "ignored_structures": 0,
+            "structure404_page1_retry": 0,
+        }
 
-    def note_status(self, status: int) -> None:
+    def incr(self, key: str, value: int = 1) -> None:
         with self._lock:
-            self.requests += 1
-            if status == 401:
-                self.http401 += 1
-            elif status == 404:
-                self.http404 += 1
-            elif status == 420:
-                self.http420 += 1
-            elif status == 429:
-                self.http429 += 1
-            elif 500 <= status <= 599:
-                self.http5xx += 1
+            self._counters[key] = self._counters.get(key, 0) + value
 
-    def add_backoff(self, seconds: float) -> None:
+    def add_seconds(self, seconds: float) -> None:
         with self._lock:
-            self.backoff_seconds += float(seconds)
+            self._counters["backoff_seconds"] = self._counters.get("backoff_seconds", 0.0) + float(seconds)
 
-    def snapshot(self) -> Dict[str, float | int]:
+    def snapshot(self) -> Dict[str, float]:
         with self._lock:
-            return {
-                "requests": self.requests,
-                "http401": self.http401,
-                "http404": self.http404,
-                "http420": self.http420,
-                "http429": self.http429,
-                "http5xx": self.http5xx,
-                "backoffSeconds": round(self.backoff_seconds, 3),
-            }
+            return dict(self._counters)
 
 
 class EsiClient:
@@ -150,7 +141,7 @@ def fetch_entity(
     token_mgr: TokenManager,
     retry_budget: RetryBudget,
     push_orders_fn,
-    stats: FetchStats,
+    stats: Optional[StatsCollector] = None,
     polite_delay_s: float = 0.30,
 ) -> Tuple[Optional[int], bool]:
     """
@@ -165,6 +156,9 @@ def fetch_entity(
     retried_404_page1 = False
 
     while True:
+        if stats:
+            stats.incr("requests", 1)
+
         if entity.kind == "region":
             resp = client.get_region_orders(entity.id, page)
         else:
@@ -172,9 +166,11 @@ def fetch_entity(
             resp = client.get_structure_orders(entity.id, page, tok)
 
         status = resp.status_code
-        stats.note_status(status)
 
         if status == 200:
+            if stats:
+                stats.incr("http200", 1)
+
             if page == 1:
                 xp = resp.headers.get("X-Pages")
                 if xp:
@@ -215,31 +211,47 @@ def fetch_entity(
             continue
 
         if status == 404:
+            if stats:
+                stats.incr("http404", 1)
+
             if entity.kind == "region":
                 break
 
             if page == 1 and not retried_404_page1:
                 retried_404_page1 = True
-                sleep_s = 5
-                stats.add_backoff(sleep_s)
-                time.sleep(sleep_s)
+                if stats:
+                    stats.incr("structure404_page1_retry", 1)
+                    stats.add_seconds(5.0)
+                time.sleep(5)
                 retry_budget.consume("structure_404_page1_retry")
                 continue
 
             ignored = True
+            if stats:
+                stats.incr("ignored_structures", 1)
             break
 
         if status == 401 and entity.kind == "structure":
+            if stats:
+                stats.incr("http401", 1)
+                stats.add_seconds(5.0)
             token_mgr.rotate()
-            sleep_s = 5
-            stats.add_backoff(sleep_s)
-            time.sleep(sleep_s)
+            time.sleep(5)
             retry_budget.consume("401_rotate_token")
             continue
 
         if status in (420, 429) or 500 <= status <= 599:
+            if stats:
+                if status == 420:
+                    stats.incr("http420", 1)
+                elif status == 429:
+                    stats.incr("http429", 1)
+                else:
+                    stats.incr("http5xx", 1)
+
             wait_s = _sleep_from_headers(resp, default_s=30)
-            stats.add_backoff(wait_s)
+            if stats:
+                stats.add_seconds(wait_s)
             time.sleep(wait_s)
             retry_budget.consume(f"{status}_retry")
             continue
@@ -247,13 +259,16 @@ def fetch_entity(
         if 400 <= status <= 499:
             if entity.kind == "structure":
                 ignored = True
+                if stats:
+                    stats.incr("ignored_structures", 1)
                 break
             raise RuntimeError(
                 f"Unexpected region error {status} for region {entity.id} page {page}: {resp.text[:200]}"
             )
 
         wait_s = _sleep_from_headers(resp, default_s=30)
-        stats.add_backoff(wait_s)
+        if stats:
+            stats.add_seconds(wait_s)
         time.sleep(wait_s)
         retry_budget.consume(f"unexpected_{status}")
 
