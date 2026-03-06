@@ -19,21 +19,19 @@ on:
         type: number
         default: 10
 
-concurrency:
-  group: eou_marketPrices_esi_gh
-  cancel-in-progress: false
-
 permissions:
+  actions: read
   contents: write
   id-token: write
-  actions: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 15
 
     env:
+      WORKFLOW_FILE: eou_marketPrices_esi-gh.yml
+
       LANDU_OWNER: landu-eou
       LANDU_REPO: eou
       LANDU_REF: main
@@ -42,14 +40,19 @@ jobs:
       OUT_REL: data/esi/marketPices.json.gz
       HUBS_REL: data/esi/hubs.json
       PAGES_CACHE_REL: states/eou_marketPrices_esi-gh_pages.json
-      TUNING_STATE_REL: states/eou_marketPrices_esi-gh_tuning.json
+      TUNING_STATE_REL: tuning/eou_marketPrices_esi-gh.json
 
       SHEETS_ID: 1fnoPr1HoO6RuQxoFY_jUVc8yTfiGa0yZ-WaxgOwWJe8
-      SHEETS_RANGE: access_tokens!D2:D12
+      SHEET_TAB: workflows
+      SHEETS_WORKFLOW_ROW: "12"
+      LOCK_TIME: 300
 
       ESI_BASE: https://esi.evetech.net/latest
       ESI_DATASOURCE: tranquility
       ESI_USER_AGENT: "eou-market-prices/1.0 (+https://github.com/camper-eou/eou)"
+
+      RUN_METRICS_PATH: .tmp/eou_marketPrices_esi-gh_run_metrics.json
+      FINALIZE_SUMMARY_PATH: .tmp/eou_marketPrices_esi-gh_finalize_summary.json
 
     steps:
       - name: Checkout (camper-eou/eou)
@@ -57,7 +60,138 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ---------------------------------------------------------------------
+      # 1) GUARD — inspirado en tu workflow de prueba adjunto
+      # ---------------------------------------------------------------------
+      - name: Guard - compute decision
+        id: guard_calc
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WF_FILE: ${{ env.WORKFLOW_FILE }}
+        run: |
+          set -euo pipefail
+
+          api="https://api.github.com/repos/${REPO}/actions/workflows/${WF_FILE}/runs?per_page=50"
+          json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${api}")"
+
+          proceed="true"
+
+          this="$(jq --arg rid "$RUN_ID" -c '
+            (.workflow_runs // [])
+            | map(select(.id == ($rid|tonumber)))
+            | .[0] // empty
+          ' <<< "$json")"
+
+          if [ -n "$this" ]; then
+            this_created="$(jq -r '.created_at' <<< "$this")"
+            this_num="$(jq -r '.run_number' <<< "$this")"
+
+            alive_at_creation="$(jq --arg rid "$RUN_ID" --arg tc "$this_created" '
+              (.workflow_runs // [])
+              | map(
+                  select(.id != ($rid|tonumber))
+                  | select(.created_at < $tc)
+                  | select(.updated_at > $tc)
+                )
+              | length
+            ' <<< "$json")"
+
+            if [ "$alive_at_creation" -gt 0 ]; then
+              proceed="false"
+            else
+              leader="$(jq '
+                (.workflow_runs // [])
+                | map(select(.status=="queued" or .status=="in_progress"))
+                | map(.run_number)
+                | min // empty
+              ' <<< "$json")"
+
+              if [ -n "$leader" ] && [ "$leader" != "$this_num" ]; then
+                proceed="false"
+              fi
+            fi
+          fi
+
+          echo "$proceed" > /tmp/proceed
+
+      - name: Guard - publish decision
+        id: guard
+        run: |
+          echo "proceed=$(cat /tmp/proceed)" >> "$GITHUB_OUTPUT"
+
+      - name: Exit if skipped (busy)
+        if: steps.guard.outputs.proceed != 'true'
+        run: |
+          echo "Skipped due to overlapping run"
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # 2) AUTH GOOGLE (WIF)
+      # ---------------------------------------------------------------------
+      - name: Auth to Google (WIF)
+        id: gcp_auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: |
+            https://www.googleapis.com/auth/spreadsheets
+            https://www.googleapis.com/auth/spreadsheets.readonly
+            https://www.googleapis.com/auth/cloud-platform
+
+      # ---------------------------------------------------------------------
+      # 3) LOCK INICIAL EN SHEETS
+      # ---------------------------------------------------------------------
+      - name: Initial lock in Sheets (in_progress + next_run)
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          ACCESS_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          row="${SHEETS_WORKFLOW_ROW}"
+
+          epoch="$(date -u -d "+${LOCK_TIME} seconds" +%s)"
+          serial="$(awk "BEGIN { printf \"%.10f\", (${epoch}/86400) + 25569 }")"
+
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_ID}/values:batchUpdate" \
+            -d "{
+              \"valueInputOption\":\"RAW\",
+              \"data\":[
+                {\"range\":\"${SHEET_TAB}!B${row}:B${row}\",\"values\":[[\"in_progress\"]]},
+                {\"range\":\"${SHEET_TAB}!D${row}:D${row}\",\"values\":[[${serial}]]}
+              ]
+            }"
+
+      # ---------------------------------------------------------------------
+      # 4) INITIALIZE LOCAL TUNING STATE
+      # ---------------------------------------------------------------------
+      - name: Initialize local tuning state (in_progress + next_run)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+
+          python "scripts/esi/eou_marketPrices_esi-gh_tuning.py" init \
+            --tuning-state "${TUNING_STATE_REL}" \
+            --base-max-workers "${{ inputs.max_workers }}" \
+            --base-retry-budget "${{ inputs.retry_budget }}" \
+            --lock-time "${LOCK_TIME}"
+
+      # ---------------------------------------------------------------------
+      # 5) CHECKOUT LANDU + PYTHON
+      # ---------------------------------------------------------------------
       - name: Checkout output repo (landu-eou/eou)
+        if: steps.guard.outputs.proceed == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.LANDU_OWNER }}/${{ env.LANDU_REPO }}
@@ -68,22 +202,19 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Python
+        if: steps.guard.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
+        if: steps.guard.outputs.proceed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements/eou_marketPrices_esi-gh_requirements.txt
 
-      - name: Auth to Google (WIF)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
-
       - name: Sync landu repo (pre-run)
+        if: steps.guard.outputs.proceed == 'true'
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
         run: |
@@ -94,11 +225,13 @@ jobs:
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git pull --rebase origin "${LANDU_REF}"
 
+      # ---------------------------------------------------------------------
+      # 6) PIPELINE
+      # ---------------------------------------------------------------------
       - name: Run pipeline (fetch → dedupe → compute → write gz/json)
-        env:
-          FORCE_REFRESH: ${{ inputs.force_refresh }}
-          BASE_MAX_WORKERS: ${{ inputs.max_workers }}
-          BASE_RETRY_BUDGET: ${{ inputs.retry_budget }}
+        id: pipeline
+        if: steps.guard.outputs.proceed == 'true'
+        continue-on-error: true
         run: |
           set -euo pipefail
 
@@ -108,31 +241,20 @@ jobs:
             --hubs-out "${LANDU_DIR}/${HUBS_REL}" \
             --pages-cache "${PAGES_CACHE_REL}" \
             --tuning-state "${TUNING_STATE_REL}" \
+            --metrics-out "${RUN_METRICS_PATH}" \
             --sheets-id "${SHEETS_ID}" \
-            --sheets-range "${SHEETS_RANGE}" \
+            --sheets-range "access_tokens!D2:D12" \
             --esi-base "${ESI_BASE}" \
             --datasource "${ESI_DATASOURCE}" \
-            --user-agent "${ESI_USER_AGENT}" \
-            --base-max-workers "${BASE_MAX_WORKERS}" \
-            --base-retry-budget "${BASE_RETRY_BUDGET}" \
-            $( [ "${FORCE_REFRESH}" = "true" ] && echo "--force-refresh" )
+            --user-agent "${ESI_USER_AGENT}"
 
-      - name: Commit camper states (pages + tuning)
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
-          if git diff --cached --quiet; then
-            echo "No camper state changes."
-            exit 0
-          fi
-
-          git commit -m "EOU: update market prices states"
-          git push
-
+      # ---------------------------------------------------------------------
+      # 7) COMMIT LANDU (un único commit para marketPices + hubs)
+      # ---------------------------------------------------------------------
       - name: Commit marketPices.json.gz + hubs.json (landu-eou/eou)
+        id: landu_commit
+        if: steps.guard.outputs.proceed == 'true' && steps.pipeline.outcome == 'success'
+        continue-on-error: true
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
         run: |
@@ -161,3 +283,95 @@ jobs:
 
           git commit -m "EOU: update marketPices.json.gz + hubs.json"
           git push origin "${LANDU_REF}"
+
+      # ---------------------------------------------------------------------
+      # 8) FINALIZE LOCAL TUNING STATE
+      # ---------------------------------------------------------------------
+      - name: Finalize tuning state
+        id: finalize_tuning
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+
+          overall_status="failed"
+          if [ "${{ steps.pipeline.outcome }}" = "success" ] && [ "${{ steps.landu_commit.outcome }}" = "success" ]; then
+            overall_status="completed"
+          fi
+
+          python "scripts/esi/eou_marketPrices_esi-gh_tuning.py" finalize \
+            --tuning-state "${TUNING_STATE_REL}" \
+            --metrics-in "${RUN_METRICS_PATH}" \
+            --summary-out "${FINALIZE_SUMMARY_PATH}" \
+            --overall-status "${overall_status}"
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path(".tmp/eou_marketPrices_esi-gh_finalize_summary.json")
+          data = json.loads(p.read_text(encoding="utf-8"))
+          with open(Path(".tmp/finalize_outputs.txt"), "w", encoding="utf-8") as f:
+              f.write(f"status={data['status']}\n")
+              f.write(f"next_run_epoch={data['next_run_epoch']}\n")
+              f.write(f"failed={data['failed']}\n")
+          PY
+
+      - name: Publish finalize outputs
+        id: finalize_outputs
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          cat .tmp/finalize_outputs.txt >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # 9) FINALIZE SHEETS
+      # ---------------------------------------------------------------------
+      - name: Finalize in Sheets (status + next_run)
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          ACCESS_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          row="${SHEETS_WORKFLOW_ROW}"
+          status="${{ steps.finalize_outputs.outputs.status }}"
+          next_run_epoch="${{ steps.finalize_outputs.outputs.next_run_epoch }}"
+
+          serial="$(awk "BEGIN { printf \"%.10f\", (${next_run_epoch}/86400) + 25569 }")"
+
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_ID}/values:batchUpdate" \
+            -d "{
+              \"valueInputOption\":\"RAW\",
+              \"data\":[
+                {\"range\":\"${SHEET_TAB}!B${row}:B${row}\",\"values\":[[\"${status}\"]]},
+                {\"range\":\"${SHEET_TAB}!D${row}:D${row}\",\"values\":[[${serial}]]}
+              ]
+            }"
+
+      # ---------------------------------------------------------------------
+      # 10) COMMIT CAMPER STATE (pages + tuning)
+      # ---------------------------------------------------------------------
+      - name: Commit camper state (pages + tuning)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
+          if git diff --cached --quiet; then
+            echo "No camper state changes."
+            exit 0
+          fi
+
+          git commit -m "EOU: update market prices state"
+          git push
+
+      # ---------------------------------------------------------------------
+      # 11) PROPAGATE FAILURE TO JOB
+      # ---------------------------------------------------------------------
+      - name: Fail job if overall status is failed
+        if: steps.guard.outputs.proceed == 'true' && steps.finalize_outputs.outputs.status == 'failed'
+        run: |
+          echo "Workflow finished with status=failed"
+          exit 1
