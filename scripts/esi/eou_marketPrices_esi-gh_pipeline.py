@@ -10,17 +10,11 @@ import logging
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _load_module(module_tag: str):
@@ -42,6 +36,7 @@ sde_mod = _load_module("sde")
 sheets_mod = _load_module("sheets")
 sqlite_mod = _load_module("sqlite")
 types_mod = _load_module("types")
+tuning_mod = _load_module("tuning")
 
 Entity = fetch_mod.Entity
 EsiClient = fetch_mod.EsiClient
@@ -65,41 +60,8 @@ connect = sqlite_mod.connect
 detect_types_file = types_mod.detect_types_file
 load_types = types_mod.load_types
 
-
-@dataclass
-class PagesCache:
-    stations: Dict[int, int]
-    structures: Dict[int, int]
-
-
-def load_pages_cache(path: Path) -> Optional[PagesCache]:
-    if not path.exists():
-        return None
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    stations = {
-        int(x["regionID"]): int(x["pages"])
-        for x in obj.get("stations", [])
-        if "regionID" in x and "pages" in x
-    }
-    structures = {
-        int(x["stationID"]): int(x["pages"])
-        for x in obj.get("structures", [])
-        if "stationID" in x and "pages" in x
-    }
-    return PagesCache(stations=stations, structures=structures)
-
-
-def write_pages_cache(
-    path: Path,
-    regions: List[Tuple[int, str, int]],
-    structures: List[Tuple[int, str, int]],
-) -> None:
-    out = {
-        "stations": [{"regionID": rid, "region": rname, "pages": pages} for rid, rname, pages in regions],
-        "structures": [{"stationID": sid, "station": sname, "pages": pages} for sid, sname, pages in structures],
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+load_tuning_state = tuning_mod.load_tuning_state
+choose_tuned_parameters = tuning_mod.choose_tuned_parameters
 
 
 def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
@@ -113,7 +75,34 @@ def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
     return bins
 
 
-def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]:
+def load_pages_cache(path: Path):
+    if not path.exists():
+        return None
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "stations": {
+            int(x["regionID"]): int(x["pages"])
+            for x in obj.get("stations", [])
+            if "regionID" in x and "pages" in x
+        },
+        "structures": {
+            int(x["stationID"]): int(x["pages"])
+            for x in obj.get("structures", [])
+            if "stationID" in x and "pages" in x
+        },
+    }
+
+
+def write_pages_cache(path: Path, regions: List[Tuple[int, str, int]], structures: List[Tuple[int, str, int]]) -> None:
+    out = {
+        "stations": [{"regionID": rid, "region": rname, "pages": pages} for rid, rname, pages in regions],
+        "structures": [{"stationID": sid, "station": sname, "pages": pages} for sid, sname, pages in structures],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def compute_hubs(conn, location_names: Dict[int, str]):
     total_orders = int(conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"])
     if total_orders <= 0:
         return 0, []
@@ -168,7 +157,7 @@ class TypeRowStream:
             return row
         return self.cur.fetchone()
 
-    def take_for_type(self, type_id: int) -> List[Tuple]:
+    def take_for_type(self, type_id: int):
         rows = []
         while True:
             row = self._next()
@@ -221,150 +210,6 @@ def write_hubs_json(path: Path, total_orders: int, hubs: List[Dict]) -> None:
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def load_tuning_state(path: Path) -> Dict:
-    if not path.exists():
-        return {
-            "version": 1,
-            "current": {"max_workers": 10, "retry_budget": 10},
-            "best": {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None},
-            "history": [],
-        }
-
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    obj.setdefault("version", 1)
-    obj.setdefault("current", {"max_workers": 10, "retry_budget": 10})
-    obj.setdefault("best", {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None})
-    obj.setdefault("history", [])
-    return obj
-
-
-def clamp(value: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(value)))
-
-
-def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: int) -> Tuple[int, int]:
-    min_workers, max_workers = 4, 16
-    min_retry, max_retry = 10, 50
-
-    current = state.get("current") or {}
-    history = state.get("history") or []
-
-    workers = int(current.get("max_workers", base_workers))
-    retry_budget = int(current.get("retry_budget", base_retry_budget))
-
-    if not history:
-        return clamp(workers, min_workers, max_workers), clamp(retry_budget, min_retry, max_retry)
-
-    last = history[-1]
-    result = last.get("result", {})
-
-    last_ok = bool(result.get("ok", False))
-    last_429 = int(result.get("http429", 0))
-    last_backoff = float(result.get("backoffSeconds", 0.0))
-    last_retries = int(result.get("retriesUsed", 0))
-    last_budget = int(last.get("selected", {}).get("retry_budget", retry_budget))
-
-    if not last_ok:
-        workers -= 2
-        retry_budget += 5
-    elif last_429 > 0 or last_backoff > 120 or (last_budget > 0 and last_retries >= int(last_budget * 0.8)):
-        workers -= 2
-        retry_budget += 5
-    elif last_429 == 0 and last_backoff < 30 and last_retries <= 2:
-        workers += 1
-        retry_budget -= 5
-
-    workers = clamp(workers, min_workers, max_workers)
-    retry_budget = clamp(retry_budget, min_retry, max_retry)
-    return workers, retry_budget
-
-
-def compute_score(ok: bool, ingest_seconds: float, retries_used: int, http401: int, http429: int, backoff_seconds: float) -> float:
-    score = float(ingest_seconds)
-    score += 15.0 * float(http429)
-    score += 5.0 * float(http401)
-    score += 0.5 * float(backoff_seconds)
-    if not ok:
-        score += 300.0
-    return score
-
-
-def update_tuning_state(
-    state: Dict,
-    selected_workers: int,
-    selected_retry_budget: int,
-    ok: bool,
-    ingest_seconds: float,
-    stats: Dict[str, float],
-    retries_used: int,
-) -> Dict:
-    ts = _utc_now_iso()
-
-    history_item = {
-        "ts": ts,
-        "selected": {
-            "max_workers": int(selected_workers),
-            "retry_budget": int(selected_retry_budget),
-        },
-        "result": {
-            "ok": bool(ok),
-            "ingestSeconds": float(ingest_seconds),
-            "retriesUsed": int(retries_used),
-            "http401": int(stats.get("http401", 0)),
-            "http429": int(stats.get("http429", 0)),
-            "backoffSeconds": float(stats.get("backoff_seconds", 0.0)),
-            "requests": int(stats.get("requests", 0)),
-            "score": compute_score(
-                ok=ok,
-                ingest_seconds=ingest_seconds,
-                retries_used=retries_used,
-                http401=int(stats.get("http401", 0)),
-                http429=int(stats.get("http429", 0)),
-                backoff_seconds=float(stats.get("backoff_seconds", 0.0)),
-            ),
-        },
-    }
-
-    history = state.get("history", [])
-    history.append(history_item)
-    history = history[-5:]  # solo 5 últimos runs
-
-    next_workers, next_retry_budget = choose_tuned_parameters(
-        {
-            **state,
-            "history": history,
-            "current": {"max_workers": selected_workers, "retry_budget": selected_retry_budget},
-        },
-        base_workers=selected_workers,
-        base_retry_budget=selected_retry_budget,
-    )
-
-    best = state.get("best", {"max_workers": 10, "retry_budget": 10, "score": None, "ts": None})
-    this_score = history_item["result"]["score"]
-    if ok and (best.get("score") is None or float(this_score) < float(best["score"])):
-        best = {
-            "max_workers": int(selected_workers),
-            "retry_budget": int(selected_retry_budget),
-            "score": float(this_score),
-            "ts": ts,
-        }
-
-    return {
-        "version": 1,
-        "current": {
-            "max_workers": int(next_workers),
-            "retry_budget": int(next_retry_budget),
-        },
-        "best": best,
-        "history": history,
-    }
-
-
-def write_tuning_state(path: Path, state: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
@@ -372,43 +217,39 @@ def main() -> None:
     ap.add_argument("--hubs-out", required=True)
     ap.add_argument("--pages-cache", required=True)
     ap.add_argument("--tuning-state", required=True)
+    ap.add_argument("--metrics-out", required=True)
     ap.add_argument("--sheets-id", required=True)
     ap.add_argument("--sheets-range", required=True)
     ap.add_argument("--esi-base", required=True)
     ap.add_argument("--datasource", required=True)
     ap.add_argument("--user-agent", required=True)
-    ap.add_argument("--base-max-workers", type=int, default=10)
-    ap.add_argument("--base-retry-budget", type=int, default=10)
-    ap.add_argument("--force-refresh", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     start_ts = time.perf_counter()
-    ok = False
+    pipeline_ok = False
     stats = StatsCollector()
-    retry_budget_obj: RetryBudget | None = None
+    retry_budget_obj = None
+    selected_workers = None
+    selected_retry_budget = None
 
     landu_root = Path(args.landu_root)
     out_path = Path(args.out)
     hubs_out_path = Path(args.hubs_out)
     pages_cache_path = Path(args.pages_cache)
     tuning_state_path = Path(args.tuning_state)
-
-    tuning_state = load_tuning_state(tuning_state_path)
-    selected_workers, selected_retry_budget = choose_tuned_parameters(
-        tuning_state,
-        base_workers=int(args.base_max_workers),
-        base_retry_budget=int(args.base_retry_budget),
-    )
-
-    LOG.info(
-        "Autotuning selected max_workers=%s retry_budget=%s",
-        selected_workers,
-        selected_retry_budget,
-    )
+    metrics_out_path = Path(args.metrics_out)
 
     try:
+        tuning_state = load_tuning_state(tuning_state_path)
+        selected_workers, selected_retry_budget = choose_tuned_parameters(
+            tuning_state,
+            base_workers=int(tuning_state["current"]["max_workers"]),
+            base_retry_budget=int(tuning_state["current"]["retry_budget"]),
+        )
+
+        LOG.info("Autotuning selected max_workers=%s retry_budget=%s", selected_workers, selected_retry_budget)
         LOG.info("Loading inputs from landu repo at %s", landu_root)
 
         types_path = detect_types_file(landu_root)
@@ -425,16 +266,16 @@ def main() -> None:
             raise SystemExit("No tokens returned from Google Sheets.")
         token_mgr = TokenManager(tokens)
 
-        cache = None if args.force_refresh else load_pages_cache(pages_cache_path)
+        cache = load_pages_cache(pages_cache_path)
         LOG.info("Pages cache: %s", "enabled" if cache else "disabled")
 
         entities: List[Entity] = []
         for r in regions:
-            est = cache.stations.get(r.region_id, 1) if cache else 1
+            est = cache["stations"].get(r.region_id, 1) if cache else 1
             entities.append(Entity(kind="region", id=r.region_id, name=r.region_name, pages_est=est))
 
         for sid, sname in structures_map.items():
-            est = cache.structures.get(sid, 1) if cache else 1
+            est = cache["structures"].get(sid, 1) if cache else 1
             entities.append(Entity(kind="structure", id=sid, name=sname, pages_est=est))
 
         bins = greedy_balance(entities, selected_workers)
@@ -617,26 +458,30 @@ def main() -> None:
         LOG.info("Wrote pages cache to %s", pages_cache_path)
 
         conn.close()
-        ok = True
+        pipeline_ok = True
         LOG.info("Done.")
 
     finally:
         elapsed = time.perf_counter() - start_ts
-        stats_snapshot = stats.snapshot()
         retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
+        stats_snapshot = stats.snapshot()
 
-        new_tuning_state = update_tuning_state(
-            state=tuning_state,
-            selected_workers=selected_workers,
-            selected_retry_budget=selected_retry_budget,
-            ok=ok,
-            ingest_seconds=elapsed,
-            stats=stats_snapshot,
-            retries_used=retries_used,
-        )
-        write_tuning_state(tuning_state_path, new_tuning_state)
-        LOG.info("Wrote tuning state to %s", tuning_state_path)
+        metrics = {
+            "selected": {
+                "max_workers": int(selected_workers or 10),
+                "retry_budget": int(selected_retry_budget or 10),
+            },
+            "result": {
+                "pipelineOk": bool(pipeline_ok),
+                "ingestSeconds": float(elapsed),
+                "retriesUsed": int(retries_used),
+                "http401": int(stats_snapshot.get("http401", 0)),
+                "http429": int(stats_snapshot.get("http429", 0)),
+                "backoffSeconds": float(stats_snapshot.get("backoff_seconds", 0.0)),
+                "requests": int(stats_snapshot.get("requests", 0)),
+            },
+        }
 
-
-if __name__ == "__main__":
-    main()
+        metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_out_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        LOG.info("Wrote run metrics to %s", metrics_out_path)
