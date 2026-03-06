@@ -1,14 +1,14 @@
 {
   "version": 1,
   "current": {
-    "max_workers": 11,
+    "max_workers": 13,
     "retry_budget": 10
   },
   "best": {
-    "max_workers": 10,
+    "max_workers": 12,
     "retry_budget": 10,
-    "score": 214.85294146300004,
-    "ts": "2026-03-06T03:05:17Z"
+    "score": 183.976051007,
+    "ts": "2026-03-06T03:11:49Z"
   },
   "history": [
     {
@@ -26,6 +26,23 @@
         "backoffSeconds": 0.0,
         "requests": 1795,
         "score": 214.85294146300004
+      }
+    },
+    {
+      "ts": "2026-03-06T03:11:49Z",
+      "selected": {
+        "max_workers": 12,
+        "retry_budget": 10
+      },
+      "result": {
+        "ok": true,
+        "ingestSeconds": 183.976051007,
+        "retriesUsed": 0,
+        "http401": 0,
+        "http429": 0,
+        "backoffSeconds": 0.0,
+        "requests": 1796,
+        "score": 183.976051007
       }
     }
   ]
