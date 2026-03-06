@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
 
@@ -19,12 +19,17 @@ class Entity:
 class RetryBudget:
     def __init__(self, initial: int):
         self._value = int(initial)
+        self._initial = int(initial)
         self._lock = Lock()
 
     @property
     def value(self) -> int:
         with self._lock:
             return self._value
+
+    @property
+    def initial(self) -> int:
+        return self._initial
 
     def consume(self, reason: str) -> None:
         with self._lock:
@@ -53,6 +58,48 @@ class TokenManager:
             self._idx += 1
             if self._idx >= len(self._tokens):
                 raise RuntimeError("All ESI access tokens exhausted (cannot access structures).")
+
+
+@dataclass
+class FetchStats:
+    requests: int = 0
+    http401: int = 0
+    http404: int = 0
+    http420: int = 0
+    http429: int = 0
+    http5xx: int = 0
+    backoff_seconds: float = 0.0
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def note_status(self, status: int) -> None:
+        with self._lock:
+            self.requests += 1
+            if status == 401:
+                self.http401 += 1
+            elif status == 404:
+                self.http404 += 1
+            elif status == 420:
+                self.http420 += 1
+            elif status == 429:
+                self.http429 += 1
+            elif 500 <= status <= 599:
+                self.http5xx += 1
+
+    def add_backoff(self, seconds: float) -> None:
+        with self._lock:
+            self.backoff_seconds += float(seconds)
+
+    def snapshot(self) -> Dict[str, float | int]:
+        with self._lock:
+            return {
+                "requests": self.requests,
+                "http401": self.http401,
+                "http404": self.http404,
+                "http420": self.http420,
+                "http429": self.http429,
+                "http5xx": self.http5xx,
+                "backoffSeconds": round(self.backoff_seconds, 3),
+            }
 
 
 class EsiClient:
@@ -103,6 +150,7 @@ def fetch_entity(
     token_mgr: TokenManager,
     retry_budget: RetryBudget,
     push_orders_fn,
+    stats: FetchStats,
     polite_delay_s: float = 0.30,
 ) -> Tuple[Optional[int], bool]:
     """
@@ -124,6 +172,7 @@ def fetch_entity(
             resp = client.get_structure_orders(entity.id, page, tok)
 
         status = resp.status_code
+        stats.note_status(status)
 
         if status == 200:
             if page == 1:
@@ -171,7 +220,9 @@ def fetch_entity(
 
             if page == 1 and not retried_404_page1:
                 retried_404_page1 = True
-                time.sleep(5)
+                sleep_s = 5
+                stats.add_backoff(sleep_s)
+                time.sleep(sleep_s)
                 retry_budget.consume("structure_404_page1_retry")
                 continue
 
@@ -180,12 +231,15 @@ def fetch_entity(
 
         if status == 401 and entity.kind == "structure":
             token_mgr.rotate()
-            time.sleep(5)
+            sleep_s = 5
+            stats.add_backoff(sleep_s)
+            time.sleep(sleep_s)
             retry_budget.consume("401_rotate_token")
             continue
 
         if status in (420, 429) or 500 <= status <= 599:
             wait_s = _sleep_from_headers(resp, default_s=30)
+            stats.add_backoff(wait_s)
             time.sleep(wait_s)
             retry_budget.consume(f"{status}_retry")
             continue
@@ -199,6 +253,7 @@ def fetch_entity(
             )
 
         wait_s = _sleep_from_headers(resp, default_s=30)
+        stats.add_backoff(wait_s)
         time.sleep(wait_s)
         retry_budget.consume(f"unexpected_{status}")
 
