@@ -9,15 +9,15 @@ on:
         type: boolean
         default: false
       max_workers:
-        description: "Workers internos para ingesta ESI (paralelismo dentro del runner)"
+        description: "0 = autotune; >0 = override manual"
         required: false
         type: number
-        default: 10
+        default: 0
       retry_budget:
-        description: "Presupuesto global de retries (401/420/429/5xx)"
+        description: "0 = autotune; >0 = override manual"
         required: false
         type: number
-        default: 10
+        default: 0
 
 concurrency:
   group: eou_marketPrices_esi_gh
@@ -42,6 +42,7 @@ jobs:
       OUT_REL: data/esi/marketPices.json.gz
       HUBS_REL: data/esi/hubs.json
       PAGES_CACHE_REL: states/eou_marketPrices_esi-gh_pages.json
+      TUNING_STATE_REL: states/eou_marketPrices_esi-gh_tuning.json
 
       SHEETS_ID: 1fnoPr1HoO6RuQxoFY_jUVc8yTfiGa0yZ-WaxgOwWJe8
       SHEETS_RANGE: access_tokens!D2:D12
@@ -106,6 +107,7 @@ jobs:
             --out "${LANDU_DIR}/${OUT_REL}" \
             --hubs-out "${LANDU_DIR}/${HUBS_REL}" \
             --pages-cache "${PAGES_CACHE_REL}" \
+            --tuning-state "${TUNING_STATE_REL}" \
             --sheets-id "${SHEETS_ID}" \
             --sheets-range "${SHEETS_RANGE}" \
             --esi-base "${ESI_BASE}" \
@@ -115,19 +117,19 @@ jobs:
             --retry-budget "${RETRY_BUDGET}" \
             $( [ "${FORCE_REFRESH}" = "true" ] && echo "--force-refresh" )
 
-      - name: Commit pages cache (camper-eou/eou)
+      - name: Commit pages cache + tuning state (camper-eou/eou)
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "${PAGES_CACHE_REL}" || true
+          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
           if git diff --cached --quiet; then
-            echo "No pages cache changes."
+            echo "No camper state changes."
             exit 0
           fi
 
-          git commit -m "EOU: update market prices pages cache"
+          git commit -m "EOU: update market prices state"
           git push
 
       - name: Commit marketPices.json.gz + hubs.json (landu-eou/eou)
