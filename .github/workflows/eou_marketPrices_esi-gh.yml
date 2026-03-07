@@ -46,6 +46,9 @@ jobs:
       PAGES_CACHE_REL: states/eou_marketPrices_esi-gh_pages.json
       TUNING_STATE_REL: tuning/eou_marketPrices_esi-gh.json
 
+      TEST_TYPE_CONFIG_REL: test/eou_marketPrices_esi-gh_type_id.json
+      TEST_DIR_REL: test
+
       SHEETS_ID: 1fnoPr1HoO6RuQxoFY_jUVc8yTfiGa0yZ-WaxgOwWJe8
       SHEET_TAB: workflows
       SHEETS_WORKFLOW_ROW: "12"
@@ -74,6 +77,18 @@ jobs:
           token: ${{ secrets.LANDU_EOU_PAT }}
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Ensure test type config exists
+        run: |
+          set -euo pipefail
+          mkdir -p "${TEST_DIR_REL}"
+          if [ ! -f "${TEST_TYPE_CONFIG_REL}" ]; then
+            cat > "${TEST_TYPE_CONFIG_REL}" <<'JSON'
+          {
+            "type_id": 34
+          }
+          JSON
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -124,7 +139,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git pull --rebase origin "${LANDU_REF}"
 
-      - name: Run pipeline (fetch → dedupe → compute → write gz/json)
+      - name: Run pipeline (fetch → dedupe → compute → write gz/json/tests)
         id: pipeline
         run: |
           set -euo pipefail
@@ -136,6 +151,8 @@ jobs:
             --pages-cache "${PAGES_CACHE_REL}" \
             --tuning-state "${TUNING_STATE_REL}" \
             --run-metrics-path "${RUN_METRICS_PATH}" \
+            --test-type-config "${TEST_TYPE_CONFIG_REL}" \
+            --test-dir "${TEST_DIR_REL}" \
             --sheets-id "${SHEETS_ID}" \
             --sheets-range "${SHEETS_RANGE}" \
             --esi-base "${ESI_BASE}" \
@@ -222,7 +239,7 @@ jobs:
             --row "${SHEETS_WORKFLOW_ROW}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
-      - name: Commit camper state (pages + tuning)
+      - name: Commit camper state (pages + tuning + tests)
         if: always()
         continue-on-error: true
         run: |
@@ -230,13 +247,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
+          git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" "${TEST_DIR_REL}" || true
           if git diff --cached --quiet; then
-            echo "No camper state changes."
+            echo "No camper state/test changes."
             exit 0
           fi
 
-          git commit -m "EOU: update market prices state"
+          git commit -m "EOU: update market prices state + tests"
           git push
 
       - name: Fail job if landu commit was not successful
