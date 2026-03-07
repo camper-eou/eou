@@ -12,6 +12,16 @@ from requests.adapters import HTTPAdapter
 
 @dataclass(frozen=True)
 class Entity:
+    """
+    Entidad de ingesta.
+
+    kind:
+      - "region"     -> endpoint público de markets por región
+      - "structure"  -> endpoint autenticado de markets por estructura
+
+    pages_est:
+      estimación histórica de páginas, usada solo para balancear workers.
+    """
     kind: str
     id: int
     name: str
@@ -19,6 +29,13 @@ class Entity:
 
 
 class RetryBudget:
+    """
+    Contador global compartido de reintentos.
+
+    Cada retry por 401 / 420 / 429 / 5xx consume una unidad.
+    Si llega a 0, el run debe fallar.
+    """
+
     def __init__(self, initial: int):
         self._initial = int(initial)
         self._value = int(initial)
@@ -44,6 +61,13 @@ class RetryBudget:
 
 
 class TokenManager:
+    """
+    Rotación secuencial de tokens de estructuras.
+
+    El orden viene ya preparado desde Sheets:
+    D12 → D11 → ... → D2
+    """
+
     def __init__(self, tokens: List[str]):
         self._tokens = [t for t in tokens if t]
         self._idx = 0
@@ -63,6 +87,15 @@ class TokenManager:
 
 
 class StatsCollector:
+    """
+    Métricas internas del run.
+
+    No se imprimen para el usuario, pero se usan para:
+      - run_metrics
+      - tuning
+      - cálculo de next_run / last_modified
+    """
+
     def __init__(self) -> None:
         self._lock = Lock()
         self._counters: Dict[str, float] = {
@@ -89,6 +122,9 @@ class StatsCollector:
             self._counters["backoff_seconds"] = self._counters.get("backoff_seconds", 0.0) + float(seconds)
 
     def observe_last_modified(self, header_value: Optional[str]) -> None:
+        """
+        Conserva el mayor Last-Modified observado en todas las respuestas válidas.
+        """
         if not header_value:
             return
         try:
@@ -113,6 +149,13 @@ class StatsCollector:
 
 
 class EsiClient:
+    """
+    Cliente HTTP reutilizable para ESI.
+
+    Usa una Session con pool de conexiones para reducir coste de handshakes
+    cuando el runner trabaja con varios workers.
+    """
+
     def __init__(self, base: str, datasource: str, user_agent: str, timeout_connect_s: int = 10, timeout_read_s: int = 30):
         self.base = base.rstrip("/")
         self.datasource = datasource
@@ -145,6 +188,13 @@ class EsiClient:
 
 
 def _sleep_from_headers(resp: requests.Response, default_s: int = 30) -> int:
+    """
+    Deriva el tiempo de espera recomendado a partir de:
+      - Retry-After
+      - límites de error de ESI
+
+    Si no hay información útil, aplica un valor conservador.
+    """
     retry_after = resp.headers.get("Retry-After")
     if retry_after is not None:
         try:
@@ -172,6 +222,13 @@ def fetch_entity(
     stats: Optional[StatsCollector] = None,
     polite_delay_s: float = 0.30,
 ) -> Tuple[Optional[int], bool]:
+    """
+    Recorre todas las páginas de una entidad.
+
+    Devuelve:
+      - pages_observed: número de páginas observado o inferido
+      - ignored: True si una estructura se ignora por reglas de 404/4xx
+    """
     pages_observed: Optional[int] = None
     ignored = False
 
