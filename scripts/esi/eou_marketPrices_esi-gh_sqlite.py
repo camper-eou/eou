@@ -21,8 +21,15 @@ CREATE TABLE IF NOT EXISTS orders (
 
 class OrdersWriter:
     """
-    Single-writer thread to avoid SQLite write contention.
-    Workers push batches into a queue.
+    Escritor único hacia SQLite.
+
+    Objetivo:
+      - evitar contención de escritura entre workers
+      - centralizar el dedupe por order_id en una sola conexión SQLite
+
+    Regla de dedupe:
+      - ante misma order_id, se conserva la fila con issued mayor
+      - si issued empata, SQLite mantiene una de ellas indistintamente
     """
 
     def __init__(self, db_path: str | Path, queue_max: int = 100000, batch_size: int = 2000):
@@ -122,6 +129,9 @@ class OrdersWriter:
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
+    """
+    Devuelve una conexión de lectura/consulta con Row factory activado.
+    """
     conn = sqlite3.connect(Path(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000;")
