@@ -1,3 +1,108 @@
+#
+# .
+# ├── .github/
+# │   └── workflows/
+# │      └── eou_marketPrices_esi-gh.yml
+# │
+# ├── requirements/
+# │   └── eou_marketPrices_esi-gh_requirements.txt
+# │
+# ├── scripts/
+# │   └── esi/
+# │      ├── eou_marketPrices_esi-gh_fetch.py
+# │      │   # Cliente HTTP ESI, entidades de ingesta, rotación de tokens,
+# │      │   # presupuesto global de retries y máquina de estados page-by-page
+# │      │   # para regiones y estructuras.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_metrics.py
+# │      │   # Cálculo robusto de cleanVWAP/IFM para BUY y SELL:
+# │      │   # highliners, lowliners, raw/dirty/clean VWAP,
+# │      │   # buyUnits/sellUnits y clasificación secure/normal/weak/insecure.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_pipeline.py
+# │      │   # Orquestación principal del run:
+# │      │   # carga SDE, elige tuning real, lee tokens de Sheets,
+# │      │   # balancea entidades entre workers, ingiere ESI,
+# │      │   # deduplica en SQLite, determina hubs,
+# │      │   # agrega libros por universo/hubs/hub individual,
+# │      │   # escribe marketPices.json.gz y hubs.json,
+# │      │   # reconstruye pages cache y actualiza run_metrics/tuning.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_sde.py
+# │      │   # Lectura de fuentes SDE/ESI ya versionadas en landu:
+# │      │   # regions.jsonl.gz, stations.jsonl.gz y structures.jsonl.gz.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_sheet.py
+# │      │   # Escritura del estado del workflow en Google Sheets:
+# │      │   # status -> B, next_run -> D, last_modified -> I.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_sheets.py
+# │      │   # Lectura readonly de access tokens desde Google Sheets
+# │      │   # (access_tokens!D2:D12), filtrado, trim e inversión D12 -> D2.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_sqlite.py
+# │      │   # Base SQLite temporal del run:
+# │      │   # tabla orders, PRAGMAs, writer único con cola,
+# │      │   # UPSERT por order_id y conservación del issued más reciente.
+# │      │
+# │      ├── eou_marketPrices_esi-gh_tuning.py
+# │      │   # Estado operativo del workflow:
+# │      │   # init, finalize-success y finalize-failure,
+# │      │   # manejo de status, next_run, failed y summary temporal.
+# │      │
+# │      └── eou_marketPrices_esi-gh_types.py
+# │          # Detección robusta del fichero de tipos en data/sde/
+# │          # y carga de pares typeID/type.
+# │
+# ├── states/
+# │   └── eou_marketPrices_esi-gh_pages.json
+# │      # Cache histórico de páginas por región y estructura.
+# │      # Se usa para planificar mejor el reparto entre workers
+# │      # en el siguiente run.
+# │
+# ├── tuning/
+# │   └── eou_marketPrices_esi-gh.json
+# │      # Estado persistente de autotuning y control operativo:
+# │      # status, next_run, failed, current, best e history.
+# │
+# ├── .tmp/
+# │   ├── eou_marketPrices_esi-gh_run_metrics.json
+# │   │   # Métricas temporales del run actual:
+# │   │   # requests, retries, score, maxLastModified, etc.
+# │   │
+# │   └── eou_marketPrices_esi-gh_finalize_summary.json
+# │       # Resumen temporal para proyectar el estado en Google Sheets
+# │       # antes y después del pipeline.
+# │
+# └── landu/                         # checkout temporal de landu-eou/eou dentro del runner
+#    └── data/
+#       ├── sde/
+#       │   ├── regions.jsonl.gz
+#       │   │   # Fuente de verdad de regiones del universo.
+#       │   │
+#       │   ├── stations.jsonl.gz
+#       │   │   # Fuente de verdad de estaciones NPC con market.
+#       │   │
+#       │   └── <types-file>.jsonl.gz
+#       │       # Fichero detectado automáticamente que contiene
+#       │       # al menos las claves typeID y type.
+#       │
+#       └── esi/
+#          ├── structures.jsonl.gz
+#          │   # Fuente de verdad de estructuras con mercado
+#          │   # que se intentan ingerir con autenticación.
+#          │
+#          ├── marketPices.json.gz
+#          │   # Salida final principal del workflow:
+#          │   # NDJSON gzip, una línea por typeID,
+#          │   # con universe, hubs agregados y cada hub individual.
+#          │
+#          └── hubs.json
+#              # Salida final secundaria:
+#              # hubs detectados, orders totales, share por hub
+#              # y número de types por hub.
+#
+
 name: ESI Market Prices (ESI → GH)
 
 on:
