@@ -162,33 +162,6 @@ def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]
     return total_orders, hubs
 
 
-class TypeRowStream:
-    def __init__(self, cursor):
-        self.cur = cursor
-        self.buf = None
-
-    def _next(self):
-        if self.buf is not None:
-            row = self.buf
-            self.buf = None
-            return row
-        return self.cur.fetchone()
-
-    def take_for_type(self, type_id: int) -> List[Tuple]:
-        rows = []
-        while True:
-            row = self._next()
-            if row is None:
-                break
-            tid = int(row[0])
-            if tid == type_id:
-                rows.append(row)
-                continue
-            self.buf = row
-            break
-        return rows
-
-
 def build_segment_entry(hub_id, hub_name: str, buy_entries, sell_entries) -> Dict:
     buy = compute_buy(buy_entries)
     sell = compute_sell(sell_entries)
@@ -505,6 +478,67 @@ def generate_test_outputs(
         )
 
 
+def fetch_universe_entries(conn: sqlite3.Connection, type_id: int) -> Tuple[List[Tuple[float, int]], List[Tuple[float, int]]]:
+    buy_rows = conn.execute(
+        """
+        SELECT price, vol
+        FROM universe_buy
+        WHERE type_id = ?
+        ORDER BY price DESC
+        """,
+        (int(type_id),),
+    ).fetchall()
+
+    sell_rows = conn.execute(
+        """
+        SELECT price, vol
+        FROM universe_sell
+        WHERE type_id = ?
+        ORDER BY price ASC
+        """,
+        (int(type_id),),
+    ).fetchall()
+
+    buy_entries = [(float(r["price"]), int(r["vol"])) for r in buy_rows]
+    sell_entries = [(float(r["price"]), int(r["vol"])) for r in sell_rows]
+    return buy_entries, sell_entries
+
+
+def fetch_hub_entries_by_loc(conn: sqlite3.Connection, type_id: int) -> Tuple[Dict[int, List[Tuple[float, int]]], Dict[int, List[Tuple[float, int]]]]:
+    buy_rows = conn.execute(
+        """
+        SELECT location_id, price, vol
+        FROM hubs_buy
+        WHERE type_id = ?
+        ORDER BY location_id ASC, price DESC
+        """,
+        (int(type_id),),
+    ).fetchall()
+
+    sell_rows = conn.execute(
+        """
+        SELECT location_id, price, vol
+        FROM hubs_sell
+        WHERE type_id = ?
+        ORDER BY location_id ASC, price ASC
+        """,
+        (int(type_id),),
+    ).fetchall()
+
+    buy_by_loc: Dict[int, List[Tuple[float, int]]] = {}
+    sell_by_loc: Dict[int, List[Tuple[float, int]]] = {}
+
+    for r in buy_rows:
+        loc = int(r["location_id"])
+        buy_by_loc.setdefault(loc, []).append((float(r["price"]), int(r["vol"])))
+
+    for r in sell_rows:
+        loc = int(r["location_id"])
+        sell_by_loc.setdefault(loc, []).append((float(r["price"]), int(r["vol"])))
+
+    return buy_by_loc, sell_by_loc
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
@@ -697,12 +731,13 @@ def main() -> None:
             ORDER BY o.type_id ASC, o.location_id ASC, o.price ASC;
             """
         )
-        conn.commit()
 
-        ub_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_buy ORDER BY type_id, price DESC;"))
-        us_stream = TypeRowStream(conn.execute("SELECT type_id, price, vol FROM universe_sell ORDER BY type_id, price ASC;"))
-        hb_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_buy ORDER BY type_id, location_id, price DESC;"))
-        hs_stream = TypeRowStream(conn.execute("SELECT type_id, location_id, price, vol FROM hubs_sell ORDER BY type_id, location_id, price ASC;"))
+        # Índices para que las consultas directas por type_id sean rápidas y deterministas
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_buy_type_price ON universe_buy(type_id, price);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_sell_type_price ON universe_sell(type_id, price);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hubs_buy_type_loc_price ON hubs_buy(type_id, location_id, price);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hubs_sell_type_loc_price ON hubs_sell(type_id, location_id, price);")
+        conn.commit()
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         LOG.info("Writing NDJSON.gz to %s", out_path)
@@ -711,27 +746,12 @@ def main() -> None:
             for t in types:
                 tid = int(t.type_id)
 
-                ub_rows = ub_stream.take_for_type(tid)
-                us_rows = us_stream.take_for_type(tid)
-                buy_univ = [(float(r[1]), int(r[2])) for r in ub_rows]
-                sell_univ = [(float(r[1]), int(r[2])) for r in us_rows]
-
-                hb_rows = hb_stream.take_for_type(tid)
-                hs_rows = hs_stream.take_for_type(tid)
-
-                buy_by_loc: Dict[int, List[Tuple[float, int]]] = {}
-                sell_by_loc: Dict[int, List[Tuple[float, int]]] = {}
-
-                for r in hb_rows:
-                    loc = int(r[1])
-                    buy_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
-
-                for r in hs_rows:
-                    loc = int(r[1])
-                    sell_by_loc.setdefault(loc, []).append((float(r[2]), int(r[3])))
+                buy_univ, sell_univ = fetch_universe_entries(conn, tid)
+                buy_by_loc, sell_by_loc = fetch_hub_entries_by_loc(conn, tid)
 
                 buy_hubs_all: List[Tuple[float, int]] = []
                 sell_hubs_all: List[Tuple[float, int]] = []
+
                 for lst in buy_by_loc.values():
                     buy_hubs_all.extend(lst)
                 for lst in sell_by_loc.values():
@@ -745,7 +765,14 @@ def main() -> None:
                 for hub in hubs:
                     loc = int(hub["stationID"])
                     name = str(hub["station"])
-                    prices.append(build_segment_entry(loc, name, buy_by_loc.get(loc, []), sell_by_loc.get(loc, [])))
+                    prices.append(
+                        build_segment_entry(
+                            loc,
+                            name,
+                            buy_by_loc.get(loc, []),
+                            sell_by_loc.get(loc, []),
+                        )
+                    )
 
                 gz.write(
                     json.dumps(
