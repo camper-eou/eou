@@ -64,11 +64,13 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
+      # Repo de trabajo: camper-eou/eou
       - name: Checkout (camper-eou/eou)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Repo de salida: landu-eou/eou
       - name: Checkout output repo (landu-eou/eou)
         uses: actions/checkout@v4
         with:
@@ -92,6 +94,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements/eou_marketPrices_esi-gh_requirements.txt
 
+      # Autenticación recomendada para acceder a Google sin claves estáticas.
       - name: Auth to Google (WIF)
         id: gcp_auth
         uses: google-github-actions/auth@v2
@@ -99,6 +102,7 @@ jobs:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
 
+      # Estado inicial del run: bloquea siguiente ejecución y deja status "in progress".
       - name: Initial lock in tuning state
         run: |
           set -euo pipefail
@@ -111,6 +115,7 @@ jobs:
             --lock-seconds "${LOCK_TIME}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
+      # Refleja estado inicial en la hoja.
       - name: Write initial status/next_run to Sheets
         run: |
           set -euo pipefail
@@ -120,6 +125,7 @@ jobs:
             --row "${SHEETS_WORKFLOW_ROW}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
+      # Sincroniza la rama destino antes de generar salidas.
       - name: Sync landu repo (pre-run)
         env:
           LANDU_EOU_PAT: ${{ secrets.LANDU_EOU_PAT }}
@@ -131,6 +137,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git pull --rebase origin "${LANDU_REF}"
 
+      # Pipeline principal: ingesta ESI, consolidación en SQLite y escritura de salidas.
       - name: Run pipeline (fetch → dedupe → compute → write gz/json)
         id: pipeline
         run: |
@@ -152,6 +159,7 @@ jobs:
             --base-retry-budget "${{ inputs.retry_budget }}" \
             $( [ "${{ inputs.force_refresh }}" = "true" ] && echo "--force-refresh" )
 
+      # Commit conjunto de marketPices + hubs en landu-eou/eou.
       - name: Commit marketPices.json.gz + hubs.json (landu-eou/eou)
         id: commit_landu
         if: steps.pipeline.outcome == 'success'
@@ -178,7 +186,6 @@ jobs:
 
           git add "${OUT_REL}" "${HUBS_REL}" || true
           if git diff --cached --quiet; then
-            echo "No marketPices/hubs changes."
             exit 0
           fi
 
@@ -186,20 +193,18 @@ jobs:
 
           pushed=0
           for attempt in 1 2 3; do
-            echo "Push attempt ${attempt}/3"
             if git push origin "${LANDU_REF}"; then
               pushed=1
               break
             fi
-            echo "Push rejected, trying pull --rebase and retry..."
             git pull --rebase origin "${LANDU_REF}"
           done
 
           if [[ "${pushed}" -ne 1 ]]; then
-            echo "Failed to push after 3 attempts."
             exit 1
           fi
 
+      # Finalización exitosa: actualiza tuning y calcula next_run.
       - name: Finalize tuning state (completed)
         if: always() && steps.commit_landu.outcome == 'success'
         run: |
@@ -210,6 +215,7 @@ jobs:
             --metrics-path "${RUN_METRICS_PATH}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
+      # Finalización fallida: incrementa failed y calcula next_run de espera.
       - name: Finalize tuning state (failed)
         if: always() && steps.commit_landu.outcome != 'success'
         run: |
@@ -219,6 +225,7 @@ jobs:
             --path "${TUNING_STATE_REL}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
+      # Refleja status/next_run/(last_modified) final en la hoja.
       - name: Write final status/next_run(/last_modified) to Sheets
         if: always()
         run: |
@@ -229,6 +236,7 @@ jobs:
             --row "${SHEETS_WORKFLOW_ROW}" \
             --summary-path "${FINALIZE_SUMMARY_PATH}"
 
+      # Commit del estado local del workflow: pages cache + tuning.
       - name: Commit camper state (pages + tuning)
         if: always()
         continue-on-error: true
@@ -240,7 +248,6 @@ jobs:
 
           git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
           if git diff --cached --quiet; then
-            echo "No camper state changes."
             exit 0
           fi
 
@@ -248,22 +255,19 @@ jobs:
 
           pushed=0
           for attempt in 1 2 3; do
-            echo "Camper push attempt ${attempt}/3"
             if git push; then
               pushed=1
               break
             fi
-            echo "Camper push rejected, trying pull --rebase and retry..."
             git pull --rebase
           done
 
           if [[ "${pushed}" -ne 1 ]]; then
-            echo "Failed to push camper state after 3 attempts."
             exit 1
           fi
 
+      # El run completo debe marcarse como fallo si no pudo escribirse correctamente en landu-eou/eou.
       - name: Fail job if landu commit was not successful
         if: always() && steps.commit_landu.outcome != 'success'
         run: |
-          echo "Run marked as failed because landu outputs were not committed correctly."
           exit 1
