@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import google.auth
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -18,9 +20,6 @@ def parse_iso_z(value: str) -> datetime:
 
 
 def to_sheets_serial(dt: datetime) -> float:
-    """
-    Convierte datetime UTC a serial numérico de Google Sheets / Excel.
-    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     epoch_seconds = dt.timestamp()
@@ -28,18 +27,42 @@ def to_sheets_serial(dt: datetime) -> float:
 
 
 def batch_update_values(spreadsheet_id: str, data: list[dict]) -> None:
-    creds, _ = google.auth.default(scopes=[SHEETS_SCOPE])
-    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    max_attempts = 6
+    base_sleep = 2.0
+    last_err: Exception | None = None
 
-    body = {
-        "valueInputOption": "USER_ENTERED",
-        "data": data,
-    }
+    for attempt in range(1, max_attempts + 1):
+        try:
+            creds, _ = google.auth.default(scopes=[SHEETS_SCOPE])
+            service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=body,
-    ).execute()
+            body = {
+                "valueInputOption": "USER_ENTERED",
+                "data": data,
+            }
+
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=body,
+            ).execute()
+            return
+
+        except RefreshError as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+
+        if attempt < max_attempts:
+            sleep_s = (base_sleep * (2 ** (attempt - 1))) + random.uniform(0.0, 1.0)
+            print(
+                f"[Sheets-write] intento {attempt}/{max_attempts} falló "
+                f"({type(last_err).__name__}). Reintentando en {sleep_s:.1f}s..."
+            )
+            time.sleep(sleep_s)
+
+    raise RuntimeError(
+        f"Failed to write to Google Sheets after {max_attempts} attempts: {last_err}"
+    )
 
 
 def main() -> None:
