@@ -20,10 +20,16 @@ LOG = logging.getLogger("eou_marketPrices_esi-gh_pipeline")
 
 
 def _utc_now_iso() -> str:
+    """
+    Fecha UTC compacta usada para run_metrics y tuning history.
+    """
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _load_module(module_tag: str):
+    """
+    Carga módulos hermanos usando el prefijo común del workflow.
+    """
     filename = BASE_DIR / f"eou_marketPrices_esi-gh_{module_tag}.py"
     mod_name = f"eou_marketPrices_esi_gh_{module_tag}"
     spec = importlib.util.spec_from_file_location(mod_name, filename)
@@ -66,6 +72,11 @@ load_types = types_mod.load_types
 
 
 def load_pages_cache(path: Path) -> Optional[Dict[str, Dict[int, int]]]:
+    """
+    Carga el planner histórico de páginas por región/estructura.
+
+    Si no existe, el reparto entre workers se basa en pages_est=1.
+    """
     if not path.exists():
         return None
     obj = json.loads(path.read_text(encoding="utf-8"))
@@ -87,6 +98,12 @@ def write_pages_cache(
     regions: List[Tuple[int, str, int]],
     structures: List[Tuple[int, str, int]],
 ) -> None:
+    """
+    Reescribe por completo el cache planner.
+
+    - regions: todas las regiones del truth set
+    - structures: solo estructuras no ignoradas
+    """
     out = {
         "stations": [{"regionID": rid, "region": rname, "pages": pages} for rid, rname, pages in regions],
         "structures": [{"stationID": sid, "station": sname, "pages": pages} for sid, sname, pages in structures],
@@ -96,6 +113,11 @@ def write_pages_cache(
 
 
 def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
+    """
+    Reparto greedy por pages_est para equilibrar workers.
+
+    Se asigna cada entidad al worker con menor carga acumulada.
+    """
     bins: List[List[Entity]] = [[] for _ in range(workers)]
     loads = [0] * workers
     entities_sorted = sorted(entities, key=lambda e: int(e.pages_est or 1), reverse=True)
@@ -107,6 +129,15 @@ def greedy_balance(entities: List[Entity], workers: int) -> List[List[Entity]]:
 
 
 def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]:
+    """
+    Determina los hubs del universo según el umbral de ordersShare > 1.75%.
+
+    Desempate:
+      1) orders desc
+      2) types desc
+      3) sum(price * volume_remain) desc
+      4) location_id asc
+    """
     total_orders = int(conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"])
     if total_orders <= 0:
         return 0, []
@@ -150,6 +181,12 @@ def compute_hubs(conn, location_names: Dict[int, str]) -> Tuple[int, List[Dict]]
 
 
 def build_segment_entry(hub_id, hub_name: str, buy_entries, sell_entries) -> Dict:
+    """
+    Calcula el bloque de salida para:
+      - universe
+      - hubs
+      - cada hub individual
+    """
     buy = compute_buy(buy_entries)
     sell = compute_sell(sell_entries)
     return {
@@ -169,6 +206,9 @@ def build_segment_entry(hub_id, hub_name: str, buy_entries, sell_entries) -> Dic
 
 
 def write_hubs_json(path: Path, total_orders: int, hubs: List[Dict]) -> None:
+    """
+    Escribe el resumen estructurado de hubs en landu-eou/eou/data/esi/hubs.json.
+    """
     out = {
         "hubs": len(hubs),
         "orders": total_orders,
@@ -188,6 +228,11 @@ def write_hubs_json(path: Path, total_orders: int, hubs: List[Dict]) -> None:
 
 
 def load_tuning_state(path: Path, base_max_workers: int, base_retry_budget: int) -> Dict:
+    """
+    Carga el estado de tuning.
+
+    Si no existe, se construye uno por defecto con los valores base.
+    """
     if not path.exists():
         return {
             "version": 1,
@@ -211,6 +256,9 @@ def load_tuning_state(path: Path, base_max_workers: int, base_retry_budget: int)
 
 
 def write_tuning_state(path: Path, state: Dict) -> None:
+    """
+    Guarda el estado de tuning de forma legible.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -220,6 +268,17 @@ def clamp(value: int, lo: int, hi: int) -> int:
 
 
 def compute_score(ok: bool, ingest_seconds: float, http401: int, http429: int, backoff_seconds: float) -> float:
+    """
+    Score simple para autotuning:
+      menor = mejor
+
+    Penaliza:
+      - duración
+      - 401
+      - 429
+      - segundos de backoff
+      - fallo completo del run
+    """
     score = float(ingest_seconds)
     score += 15.0 * float(http429)
     score += 5.0 * float(http401)
@@ -230,6 +289,14 @@ def compute_score(ok: bool, ingest_seconds: float, http401: int, http429: int, b
 
 
 def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: int) -> Tuple[int, int]:
+    """
+    Selecciona la combinación a probar en este run.
+
+    Mantiene la estrategia actual:
+      - explora alrededor del mejor
+      - baja workers si hubo presión/rate limit
+      - sube retry_budget si el run fue problemático
+    """
     min_workers, max_workers = 4, 16
     min_retry, max_retry = 10, 50
 
@@ -293,11 +360,17 @@ def choose_tuned_parameters(state: Dict, base_workers: int, base_retry_budget: i
 
 
 def write_run_metrics(path: Path, payload: Dict) -> None:
+    """
+    Guarda métricas del run para que tuning/finalización puedan reutilizarlas.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def fetch_universe_entries(conn: sqlite3.Connection, type_id: int) -> Tuple[List[Tuple[float, int]], List[Tuple[float, int]]]:
+    """
+    Recupera el libro agregado del universo para un type_id.
+    """
     buy_rows = conn.execute(
         """
         SELECT price, vol
@@ -324,6 +397,13 @@ def fetch_universe_entries(conn: sqlite3.Connection, type_id: int) -> Tuple[List
 
 
 def fetch_hub_entries_by_loc(conn: sqlite3.Connection, type_id: int) -> Tuple[Dict[int, List[Tuple[float, int]]], Dict[int, List[Tuple[float, int]]]]:
+    """
+    Recupera el libro agregado por hub para un type_id.
+
+    Devuelve dos diccionarios:
+      - buy_by_loc[location_id] = [(price, vol), ...]
+      - sell_by_loc[location_id] = [(price, vol), ...]
+    """
     buy_rows = conn.execute(
         """
         SELECT location_id, price, vol
@@ -359,6 +439,18 @@ def fetch_hub_entries_by_loc(conn: sqlite3.Connection, type_id: int) -> Tuple[Di
 
 
 def main() -> None:
+    """
+    Flujo principal:
+
+      1) Carga inputs y estado
+      2) Decide max_workers / retry_budget
+      3) Ingiere órdenes ESI hacia SQLite temporal
+      4) Determina hubs
+      5) Agrega universe / hubs / cada hub
+      6) Escribe marketPices.json.gz y hubs.json
+      7) Reescribe pages cache
+      8) Actualiza tuning + run_metrics
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--landu-root", required=True)
     ap.add_argument("--out", required=True)
@@ -376,7 +468,8 @@ def main() -> None:
     ap.add_argument("--force-refresh", action="store_true")
     args = ap.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Se mantiene logging por compatibilidad, pero no se emiten mensajes informativos.
+    logging.basicConfig(level=logging.CRITICAL)
 
     start_ts = time.perf_counter()
     ok = False
@@ -402,11 +495,7 @@ def main() -> None:
         base_retry_budget=int(args.base_retry_budget),
     )
 
-    LOG.info("Autotuning selected max_workers=%s retry_budget=%s", selected_workers, selected_retry_budget)
-
     try:
-        LOG.info("Loading inputs from landu repo at %s", landu_root)
-
         types_path = detect_types_file(landu_root)
         types = load_types(types_path)
         regions = load_regions(landu_root)
@@ -415,14 +504,12 @@ def main() -> None:
         structures_map = load_structures_map(landu_root)
         location_names = {**stations_map, **structures_map}
 
-        LOG.info("Reading structure access tokens from Google Sheets (range %s)", args.sheets_range)
         tokens = read_tokens_from_sheet(args.sheets_id, args.sheets_range)
         if not tokens:
             raise SystemExit("No tokens returned from Google Sheets.")
         token_mgr = TokenManager(tokens)
 
         cache = None if args.force_refresh else load_pages_cache(pages_cache_path)
-        LOG.info("Pages cache: %s", "enabled" if cache else "disabled")
 
         entities: List[Entity] = []
         for r in regions:
@@ -434,7 +521,6 @@ def main() -> None:
             entities.append(Entity(kind="structure", id=sid, name=sname, pages_est=est))
 
         bins = greedy_balance(entities, selected_workers)
-        LOG.info("Planned %d entities across %d workers", len(entities), selected_workers)
 
         retry_budget_obj = RetryBudget(selected_retry_budget)
         client = EsiClient(base=args.esi_base, datasource=args.datasource, user_agent=args.user_agent)
@@ -472,19 +558,16 @@ def main() -> None:
                     else:
                         observed_structs[ent.id] = pages
 
-        LOG.info("Starting ingestion")
         with concurrent.futures.ThreadPoolExecutor(max_workers=selected_workers) as ex:
             futs = [ex.submit(worker_fn, b) for b in bins if b]
             for f in concurrent.futures.as_completed(futs):
                 f.result()
 
         writer.stop()
-        LOG.info("Ingestion complete; DB at %s", db_path)
 
         conn = connect(db_path)
 
         total_orders, hubs = compute_hubs(conn, location_names)
-        LOG.info("Hubs passing 1.75%% threshold: %d", len(hubs))
 
         conn.execute("DROP TABLE IF EXISTS hubs;")
         conn.execute("CREATE TEMP TABLE hubs (location_id INTEGER PRIMARY KEY, rank INTEGER NOT NULL, name TEXT NOT NULL);")
@@ -495,6 +578,7 @@ def main() -> None:
             )
         conn.commit()
 
+        # Tablas agregadas base.
         conn.execute("DROP TABLE IF EXISTS universe_buy;")
         conn.execute(
             """
@@ -539,6 +623,7 @@ def main() -> None:
             """
         )
 
+        # Índices para consulta rápida por type_id y por hub.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_buy_type_price ON universe_buy(type_id, price);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_sell_type_price ON universe_sell(type_id, price);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hubs_buy_type_loc_price ON hubs_buy(type_id, location_id, price);")
@@ -546,8 +631,9 @@ def main() -> None:
         conn.commit()
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        LOG.info("Writing NDJSON.gz to %s", out_path)
 
+        # Salida principal NDJSON.gz:
+        # una línea por typeID con bloques universe / hubs / hub1..hubN
         with gzip.open(out_path, "wt", encoding="utf-8") as gz:
             for t in types:
                 tid = int(t.type_id)
@@ -590,7 +676,6 @@ def main() -> None:
                 )
 
         write_hubs_json(hubs_out_path, total_orders, hubs)
-        LOG.info("Wrote hubs json to %s", hubs_out_path)
 
         regions_cache_rows = [(r.region_id, r.region_name, int(observed_regions.get(r.region_id, 1))) for r in regions]
         structs_cache_rows = []
@@ -600,13 +685,12 @@ def main() -> None:
             structs_cache_rows.append((sid, sname, int(observed_structs.get(sid, 1))))
 
         write_pages_cache(pages_cache_path, regions_cache_rows, structs_cache_rows)
-        LOG.info("Wrote pages cache to %s", pages_cache_path)
 
         conn.close()
         ok = True
-        LOG.info("Done.")
 
     finally:
+        # Se guarda siempre el resultado del run, incluso si hubo excepción.
         elapsed = time.perf_counter() - start_ts
         stats_snapshot = stats.snapshot()
         retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
@@ -691,8 +775,6 @@ def main() -> None:
                 "maxLastModified": stats_snapshot.get("max_last_modified"),
             },
         )
-        LOG.info("Wrote tuning state to %s", tuning_state_path)
-        LOG.info("Wrote run metrics to %s", run_metrics_path)
 
 
 if __name__ == "__main__":
