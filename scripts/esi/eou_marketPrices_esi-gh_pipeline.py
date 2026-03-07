@@ -7,6 +7,7 @@ import gzip
 import importlib.util
 import json
 import logging
+import sqlite3
 import sys
 import tempfile
 import time
@@ -499,9 +500,9 @@ def main() -> None:
             """
             CREATE TEMP TABLE universe_buy AS
             SELECT type_id, price, SUM(volume_remain) AS vol
-            FROM orders WHERE is_buy=1
-            GROUP BY type_id, price
-            ORDER BY type_id ASC, price DESC;
+            FROM orders
+            WHERE is_buy = 1
+            GROUP BY type_id, price;
             """
         )
         conn.execute("DROP TABLE IF EXISTS universe_sell;")
@@ -509,9 +510,9 @@ def main() -> None:
             """
             CREATE TEMP TABLE universe_sell AS
             SELECT type_id, price, SUM(volume_remain) AS vol
-            FROM orders WHERE is_buy=0
-            GROUP BY type_id, price
-            ORDER BY type_id ASC, price ASC;
+            FROM orders
+            WHERE is_buy = 0
+            GROUP BY type_id, price;
             """
         )
 
@@ -522,9 +523,8 @@ def main() -> None:
             SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
             FROM orders o
             JOIN hubs h ON h.location_id = o.location_id
-            WHERE o.is_buy=1
-            GROUP BY o.type_id, o.location_id, o.price
-            ORDER BY o.type_id ASC, o.location_id ASC, o.price DESC;
+            WHERE o.is_buy = 1
+            GROUP BY o.type_id, o.location_id, o.price;
             """
         )
         conn.execute("DROP TABLE IF EXISTS hubs_sell;")
@@ -534,9 +534,8 @@ def main() -> None:
             SELECT o.type_id, o.location_id, o.price, SUM(o.volume_remain) AS vol
             FROM orders o
             JOIN hubs h ON h.location_id = o.location_id
-            WHERE o.is_buy=0
-            GROUP BY o.type_id, o.location_id, o.price
-            ORDER BY o.type_id ASC, o.location_id ASC, o.price ASC;
+            WHERE o.is_buy = 0
+            GROUP BY o.type_id, o.location_id, o.price;
             """
         )
 
@@ -611,12 +610,6 @@ def main() -> None:
         elapsed = time.perf_counter() - start_ts
         stats_snapshot = stats.snapshot()
         retries_used = retry_budget_obj.used() if retry_budget_obj is not None else 0
-
-        tuning_state = load_tuning_state(
-            tuning_state_path,
-            base_max_workers=int(args.base_max_workers),
-            base_retry_budget=int(args.base_retry_budget),
-        )
 
         ts = _utc_now_iso()
 
