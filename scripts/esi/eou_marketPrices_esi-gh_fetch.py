@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 
 @dataclass(frozen=True)
@@ -112,16 +113,25 @@ class StatsCollector:
 
 
 class EsiClient:
-    def __init__(self, base: str, datasource: str, user_agent: str, timeout_s: int = 30):
+    def __init__(self, base: str, datasource: str, user_agent: str, timeout_connect_s: int = 10, timeout_read_s: int = 30):
         self.base = base.rstrip("/")
         self.datasource = datasource
         self.user_agent = user_agent
-        self.timeout_s = timeout_s
+        self.timeout = (timeout_connect_s, timeout_read_s)
         self.session = requests.Session()
 
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
     def _get(self, url: str, headers: Dict[str, str]) -> requests.Response:
-        hdrs = {"Accept": "application/json", "User-Agent": self.user_agent, **headers}
-        return self.session.get(url, headers=hdrs, timeout=self.timeout_s)
+        hdrs = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "User-Agent": self.user_agent,
+            **headers,
+        }
+        return self.session.get(url, headers=hdrs, timeout=self.timeout)
 
     def get_region_orders(self, region_id: int, page: int) -> requests.Response:
         url = f"{self.base}/markets/{region_id}/orders/"
@@ -188,13 +198,12 @@ def fetch_entity(
             if stats:
                 stats.incr("http200", 1)
 
-            if page == 1:
-                xp = resp.headers.get("X-Pages")
-                if xp:
-                    try:
-                        pages_observed = int(xp)
-                    except Exception:
-                        pages_observed = None
+            xp = resp.headers.get("X-Pages")
+            if xp:
+                try:
+                    pages_observed = int(xp)
+                except Exception:
+                    pass
 
             data = resp.json()
             out = []
