@@ -26,7 +26,10 @@ concurrency:
 permissions:
   contents: write
   id-token: write
-  actions: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   run:
@@ -34,8 +37,6 @@ jobs:
     timeout-minutes: 15
 
     env:
-      WORKFLOW_FILE: eou_marketPrices_esi-gh.yml
-
       LANDU_OWNER: landu-eou
       LANDU_REPO: eou
       LANDU_REF: main
@@ -59,6 +60,9 @@ jobs:
       RUN_METRICS_PATH: .tmp/eou_marketPrices_esi-gh_run_metrics.json
       FINALIZE_SUMMARY_PATH: .tmp/eou_marketPrices_esi-gh_finalize_summary.json
 
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
     steps:
       - name: Checkout (camper-eou/eou)
         uses: actions/checkout@v4
@@ -79,9 +83,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements/eou_marketPrices_esi-gh_requirements.txt
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements/eou_marketPrices_esi-gh_requirements.txt
 
@@ -119,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "${LANDU_DIR}"
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
           git pull --rebase origin "${LANDU_REF}"
@@ -155,7 +162,7 @@ jobs:
           set -euo pipefail
 
           cd "${LANDU_DIR}"
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${LANDU_EOU_PAT}@github.com/${LANDU_OWNER}/${LANDU_REPO}.git"
 
@@ -227,7 +234,8 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          git config user.name  "github-actions[bot]"
+
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add "${PAGES_CACHE_REL}" "${TUNING_STATE_REL}" || true
@@ -237,7 +245,22 @@ jobs:
           fi
 
           git commit -m "EOU: update market prices state"
-          git push
+
+          pushed=0
+          for attempt in 1 2 3; do
+            echo "Camper push attempt ${attempt}/3"
+            if git push; then
+              pushed=1
+              break
+            fi
+            echo "Camper push rejected, trying pull --rebase and retry..."
+            git pull --rebase
+          done
+
+          if [[ "${pushed}" -ne 1 ]]; then
+            echo "Failed to push camper state after 3 attempts."
+            exit 1
+          fi
 
       - name: Fail job if landu commit was not successful
         if: always() && steps.commit_landu.outcome != 'success'
