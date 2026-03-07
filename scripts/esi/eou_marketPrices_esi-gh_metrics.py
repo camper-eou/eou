@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 MAD_TO_SIGMA = 1.4826
 TAU = 3.0
-BETA = 0.10
 G_MIN = 0.50
 
 
@@ -42,10 +41,18 @@ def _classify_ifm(ifm: float) -> str:
     return "insecure"
 
 
-def compute_buy(entries: List[Tuple[float, int]]) -> dict:
+def analyze_buy(entries: List[Tuple[float, int]]) -> Dict:
     total_units = sum(int(u) for _, u in entries if u > 0)
     if total_units <= 0:
-        return {"price": None, "units": 0, "totalUnits": 0, "ifm": 0.0, "ifmName": "insecure"}
+        return {
+            "price": None,
+            "units": 0,
+            "totalUnits": 0,
+            "ifm": 0.0,
+            "ifmName": "insecure",
+            "highliner_prices": set(),
+            "lowliner_prices": set(),
+        }
 
     prices = [float(p) for p, u in entries if u > 0]
     raw_vwap = _vwap(entries)
@@ -89,8 +96,6 @@ def compute_buy(entries: List[Tuple[float, int]]) -> dict:
         if L1 < 0:
             L1 = 0.0
 
-    # CAMBIO PEDIDO:
-    # LOWLINER BUY se marca solo por pi < L1 (se elimina ui > U_beta)
     lowliner_prices = {p for p, _u in entries_wo_high if p < L1}
 
     clean_entries = [
@@ -101,7 +106,15 @@ def compute_buy(entries: List[Tuple[float, int]]) -> dict:
     clean_vwap = _vwap(clean_entries)
 
     if clean_vwap is None or clean_vwap <= 0:
-        return {"price": None, "units": 0, "totalUnits": int(total_units), "ifm": 0.0, "ifmName": "insecure"}
+        return {
+            "price": None,
+            "units": 0,
+            "totalUnits": int(total_units),
+            "ifm": 0.0,
+            "ifmName": "insecure",
+            "highliner_prices": set(highliner_prices),
+            "lowliner_prices": set(lowliner_prices),
+        }
 
     units = sum(u for p, u in entries if u > 0 and p >= clean_vwap and float(p) not in lowliner_prices)
 
@@ -131,13 +144,23 @@ def compute_buy(entries: List[Tuple[float, int]]) -> dict:
         "totalUnits": int(total_units),
         "ifm": float(ifm),
         "ifmName": _classify_ifm(ifm),
+        "highliner_prices": set(highliner_prices),
+        "lowliner_prices": set(lowliner_prices),
     }
 
 
-def compute_sell(entries: List[Tuple[float, int]]) -> dict:
+def analyze_sell(entries: List[Tuple[float, int]]) -> Dict:
     total_units = sum(int(u) for _, u in entries if u > 0)
     if total_units <= 0:
-        return {"price": None, "units": 0, "totalUnits": 0, "ifm": 0.0, "ifmName": "insecure"}
+        return {
+            "price": None,
+            "units": 0,
+            "totalUnits": 0,
+            "ifm": 0.0,
+            "ifmName": "insecure",
+            "highliner_prices": set(),
+            "lowliner_prices": set(),
+        }
 
     prices = [float(p) for p, u in entries if u > 0]
     raw_vwap = _vwap(entries)
@@ -179,8 +202,6 @@ def compute_sell(entries: List[Tuple[float, int]]) -> dict:
 
     U1 = (med2 + TAU * sigma2) if (med2 is not None and sigma2 is not None) else None
 
-    # CAMBIO PEDIDO:
-    # HIGHLINER SELL se marca solo por pi > U1 (se elimina ui > U_beta)
     highliner_prices = set()
     if U1 is not None:
         for p, _u in entries_wo_low:
@@ -195,7 +216,15 @@ def compute_sell(entries: List[Tuple[float, int]]) -> dict:
     clean_vwap = _vwap(clean_entries)
 
     if clean_vwap is None or clean_vwap <= 0:
-        return {"price": None, "units": 0, "totalUnits": int(total_units), "ifm": 0.0, "ifmName": "insecure"}
+        return {
+            "price": None,
+            "units": 0,
+            "totalUnits": int(total_units),
+            "ifm": 0.0,
+            "ifmName": "insecure",
+            "highliner_prices": set(highliner_prices),
+            "lowliner_prices": set(lowliner_prices),
+        }
 
     units = sum(u for p, u in entries if u > 0 and p <= clean_vwap and float(p) not in lowliner_prices)
 
@@ -225,4 +254,28 @@ def compute_sell(entries: List[Tuple[float, int]]) -> dict:
         "totalUnits": int(total_units),
         "ifm": float(ifm),
         "ifmName": _classify_ifm(ifm),
+        "highliner_prices": set(highliner_prices),
+        "lowliner_prices": set(lowliner_prices),
+    }
+
+
+def compute_buy(entries: List[Tuple[float, int]]) -> Dict:
+    res = analyze_buy(entries)
+    return {
+        "price": res["price"],
+        "units": res["units"],
+        "totalUnits": res["totalUnits"],
+        "ifm": res["ifm"],
+        "ifmName": res["ifmName"],
+    }
+
+
+def compute_sell(entries: List[Tuple[float, int]]) -> Dict:
+    res = analyze_sell(entries)
+    return {
+        "price": res["price"],
+        "units": res["units"],
+        "totalUnits": res["totalUnits"],
+        "ifm": res["ifm"],
+        "ifmName": res["ifmName"],
     }
