@@ -3,7 +3,7 @@
 {"type_id":20187,"is_buy_order":false,"volume_remain":2,"price":1498000000.0,"issued":"2026/03/03 20:43:14","order_id":7275586966,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1600000000.0,"issued":"2026/02/16 13:32:15","order_id":7265504556,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1800000000.0,"issued":"2026/01/09 22:55:56","order_id":7235004930,"flag":null}
-{"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1833000000.0,"issued":"2026/03/07 02:26:30","order_id":7279762755,"flag":null}
+{"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1833000000.0,"issued":"2026/03/07 03:35:04","order_id":7279792729,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1834000000.0,"issued":"2026/03/07 02:08:20","order_id":7279754613,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1835000000.0,"issued":"2026/03/06 22:26:44","order_id":7279645255,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1836000000.0,"issued":"2026/03/06 21:08:34","order_id":7279599925,"flag":null}
@@ -24,6 +24,7 @@
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1869000000.0,"issued":"2026/03/02 00:32:48","order_id":7276236145,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1870000000.0,"issued":"2026/03/05 14:50:11","order_id":7278671239,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1872000000.0,"issued":"2026/02/21 15:12:35","order_id":7268629457,"flag":null}
+{"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1875000000.0,"issued":"2026/03/07 03:23:47","order_id":7273982322,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1886000000.0,"issued":"2026/02/20 05:27:17","order_id":7268280178,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1889000000.0,"issued":"2026/03/05 07:06:14","order_id":7278468212,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1890000000.0,"issued":"2026/02/17 16:41:32","order_id":7266412917,"flag":null}
@@ -35,7 +36,6 @@
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1898000000.0,"issued":"2026/02/10 21:43:51","order_id":7260976593,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1900000000.0,"issued":"2025/12/17 17:24:46","order_id":7214981140,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1916000000.0,"issued":"2026/03/01 00:56:24","order_id":7243589181,"flag":null}
-{"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1945000000.0,"issued":"2026/03/02 15:26:00","order_id":7273982322,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1950000000.0,"issued":"2026/01/18 07:01:23","order_id":7242024427,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1957000000.0,"issued":"2026/02/17 09:49:48","order_id":7266196795,"flag":null}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":1958000000.0,"issued":"2026/02/10 21:26:14","order_id":7260964803,"flag":null}
@@ -112,6 +112,8 @@
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":4499000000.0,"issued":"2026/02/09 17:51:42","order_id":7260063846,"flag":"highliner"}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":4900000000.0,"issued":"2026/03/06 05:03:52","order_id":7279101867,"flag":"highliner"}
 {"type_id":20187,"is_buy_order":false,"volume_remain":1,"price":7000000000.0,"issued":"2026/03/05 06:15:38","order_id":7138106655,"flag":"highliner"}
+{"type_id":20187,"is_buy_order":true,"volume_remain":1,"price":1638000000.0,"issued":"2026/03/07 03:36:23","order_id":7279793266,"flag":null}
+{"type_id":20187,"is_buy_order":true,"volume_remain":1,"price":1636000000.0,"issued":"2026/03/07 03:35:08","order_id":7279792737,"flag":null}
 {"type_id":20187,"is_buy_order":true,"volume_remain":1,"price":1635000000.0,"issued":"2026/03/07 01:03:42","order_id":7279650486,"flag":null}
 {"type_id":20187,"is_buy_order":true,"volume_remain":1,"price":1634000000.0,"issued":"2026/03/07 00:49:26","order_id":7279713584,"flag":null}
 {"type_id":20187,"is_buy_order":true,"volume_remain":1,"price":1631000000.0,"issued":"2026/03/06 20:35:34","order_id":7279577303,"flag":null}
@@ -230,4 +232,4 @@
 {"type_id":20187,"is_buy_order":true,"volume_remain":1000,"price":0.01,"issued":"2026/02/05 09:19:07","order_id":7256383900,"flag":null}
 {"type_id":20187,"is_buy_order":true,"volume_remain":1000,"price":0.01,"issued":"2026/02/05 16:15:21","order_id":7256605714,"flag":null}
 {"type_id":20187,"is_buy_order":true,"volume_remain":1000,"price":0.01,"issued":"2026/02/06 15:59:50","order_id":7257329758,"flag":null}
-{"_summary": {"type_id": 20187, "type": "Obelisk", "sellPrice": 2008542857.142857, "sellUnits": 61, "sellTotalUnits": 120, "sellFMI": 0.7430996788420414, "sellFMIn": "normal", "buyPrice": 27051.888381869758, "buyUnits": 127, "buyTotalUnits": 3015227, "buyFMI": 7.528454739891277e-05, "buyFMIn": "insecure"}}
+{"_summary": {"type_id": 20187, "type": "Obelisk", "sellPrice": 2007876190.4761906, "sellUnits": 61, "sellTotalUnits": 120, "sellFMI": 0.7430386347574078, "sellFMIn": "normal", "buyPrice": 28137.69178062429, "buyUnits": 129, "buyTotalUnits": 3015229, "buyFMI": 7.594779699982013e-05, "buyFMIn": "insecure"}}
