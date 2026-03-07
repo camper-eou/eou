@@ -12,11 +12,6 @@ SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
 
 def read_tokens_from_sheet(spreadsheet_id: str, range_a1: str) -> List[str]:
-    """
-    Lee tokens desde Sheets usando ADC (WIF/OIDC).
-    Añadimos reintentos con backoff porque a veces el refresh del token
-    federado falla temporalmente por red.
-    """
     max_attempts = 6
     base_sleep = 2.0
     last_err: Exception | None = None
@@ -43,7 +38,6 @@ def read_tokens_from_sheet(spreadsheet_id: str, range_a1: str) -> List[str]:
                 if tok:
                     tokens.append(tok)
 
-            # D12 → ... → D2
             tokens.reverse()
             return tokens
 
