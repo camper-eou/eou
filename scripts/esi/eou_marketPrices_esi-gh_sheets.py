@@ -12,6 +12,14 @@ SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 
 
 def read_tokens_from_sheet(spreadsheet_id: str, range_a1: str) -> List[str]:
+    """
+    Lee los access tokens de estructuras desde Google Sheets.
+
+    Reglas ya integradas:
+      - filtra vacíos
+      - trim
+      - invierte el orden para devolver D12 → ... → D2
+    """
     max_attempts = 6
     base_sleep = 2.0
     last_err: Exception | None = None
@@ -48,10 +56,6 @@ def read_tokens_from_sheet(spreadsheet_id: str, range_a1: str) -> List[str]:
 
         if attempt < max_attempts:
             sleep_s = (base_sleep * (2 ** (attempt - 1))) + random.uniform(0.0, 1.0)
-            print(
-                f"[Sheets-read] intento {attempt}/{max_attempts} falló "
-                f"({type(last_err).__name__}). Reintentando en {sleep_s:.1f}s..."
-            )
             time.sleep(sleep_s)
 
     raise RuntimeError(
