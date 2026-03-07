@@ -4,7 +4,7 @@ import queue
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 CREATE_ORDERS_SQL = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -63,6 +63,27 @@ class OrdersWriter:
         if self._exc:
             raise self._exc
 
+    def _flush(self, conn: sqlite3.Connection, batch: List[tuple]) -> None:
+        if not batch:
+            return
+
+        insert_sql = """
+        INSERT INTO orders(order_id, issued, location_id, type_id, is_buy, price, volume_remain)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(order_id) DO UPDATE SET
+          issued=excluded.issued,
+          location_id=excluded.location_id,
+          type_id=excluded.type_id,
+          is_buy=excluded.is_buy,
+          price=excluded.price,
+          volume_remain=excluded.volume_remain
+        WHERE excluded.issued > orders.issued;
+        """
+
+        conn.executemany(insert_sql, batch)
+        conn.commit()
+        batch.clear()
+
     def _run(self) -> None:
         conn = sqlite3.connect(self.db_path)
         try:
@@ -71,20 +92,7 @@ class OrdersWriter:
             conn.execute("PRAGMA temp_store=MEMORY;")
             conn.execute("PRAGMA busy_timeout=60000;")
 
-            insert_sql = """
-            INSERT INTO orders(order_id, issued, location_id, type_id, is_buy, price, volume_remain)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(order_id) DO UPDATE SET
-              issued=excluded.issued,
-              location_id=excluded.location_id,
-              type_id=excluded.type_id,
-              is_buy=excluded.is_buy,
-              price=excluded.price,
-              volume_remain=excluded.volume_remain
-            WHERE excluded.issued > orders.issued;
-            """
-
-            batch: List[Tuple] = []
+            batch: List[tuple] = []
             while True:
                 item = self.queue.get()
                 if item is self._stop:
@@ -103,13 +111,9 @@ class OrdersWriter:
                         )
                     )
                     if len(batch) >= self.batch_size:
-                        conn.executemany(insert_sql, batch)
-                        conn.commit()
-                        batch.clear()
+                        self._flush(conn, batch)
 
-            if batch:
-                conn.executemany(insert_sql, batch)
-                conn.commit()
+            self._flush(conn, batch)
 
         except BaseException as e:
             self._exc = e
@@ -121,4 +125,5 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(Path(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
     return conn
