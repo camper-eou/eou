@@ -7,7 +7,6 @@ import gzip
 import importlib.util
 import json
 import logging
-import sqlite3
 import sys
 import tempfile
 import time
@@ -51,8 +50,6 @@ fetch_entity = fetch_mod.fetch_entity
 
 compute_buy = metrics_mod.compute_buy
 compute_sell = metrics_mod.compute_sell
-analyze_buy = metrics_mod.analyze_buy
-analyze_sell = metrics_mod.analyze_sell
 
 load_regions = sde_mod.load_regions
 load_stations_map = sde_mod.load_stations_map
@@ -65,17 +62,6 @@ connect = sqlite_mod.connect
 
 detect_types_file = types_mod.detect_types_file
 load_types = types_mod.load_types
-
-
-def format_issued(issued: str) -> str:
-    dt = datetime.fromisoformat(issued.replace("Z", "+00:00"))
-    dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y/%m/%d %H:%M:%S")
-
-
-def load_test_type_id(path: Path) -> int:
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    return int(obj["type_id"])
 
 
 def load_pages_cache(path: Path) -> Optional[Dict[str, Dict[int, int]]]:
@@ -310,174 +296,6 @@ def write_run_metrics(path: Path, payload: Dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def fetch_raw_segment_rows(conn: sqlite3.Connection, type_id: int, location_ids: Optional[List[int]]) -> List[Dict]:
-    where = "type_id = ?"
-    params: List = [int(type_id)]
-    if location_ids is not None:
-        if not location_ids:
-            return []
-        placeholders = ",".join("?" for _ in location_ids)
-        where += f" AND location_id IN ({placeholders})"
-        params.extend(int(x) for x in location_ids)
-
-    sql = f"""
-    SELECT type_id, is_buy, volume_remain, price, issued, order_id
-    FROM orders
-    WHERE {where}
-    ORDER BY
-      is_buy ASC,
-      CASE WHEN is_buy = 0 THEN price END ASC,
-      CASE WHEN is_buy = 1 THEN price END DESC,
-      issued ASC,
-      order_id DESC
-    """
-    rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def aggregate_entries_for_flags(rows: List[Dict]) -> Tuple[List[Tuple[float, int]], List[Tuple[float, int]]]:
-    sell_map: Dict[float, int] = {}
-    buy_map: Dict[float, int] = {}
-    for r in rows:
-        price = float(r["price"])
-        vol = int(r["volume_remain"])
-        if int(r["is_buy"]) == 1:
-            buy_map[price] = buy_map.get(price, 0) + vol
-        else:
-            sell_map[price] = sell_map.get(price, 0) + vol
-
-    sell_entries = sorted(sell_map.items(), key=lambda x: x[0])
-    buy_entries = sorted(buy_map.items(), key=lambda x: x[0], reverse=True)
-    return buy_entries, sell_entries
-
-
-def summarize_market_line(type_id: int, type_name: str, hub_id, hub_name: str, buy_entries, sell_entries) -> Dict:
-    entry = build_segment_entry(hub_id, hub_name, buy_entries, sell_entries)
-    out = {
-        "type_id": int(type_id),
-        "type": str(type_name),
-        "sellPrice": entry["sellPrice"],
-        "sellUnits": entry["sellUnits"],
-        "sellTotalUnits": entry["sellTotalUnits"],
-        "sellFMI": entry["sellFMI"],
-        "sellFMIn": entry["sellFMIn"],
-        "buyPrice": entry["buyPrice"],
-        "buyUnits": entry["buyUnits"],
-        "buyTotalUnits": entry["buyTotalUnits"],
-        "buyFMI": entry["buyFMI"],
-        "buyFMIn": entry["buyFMIn"],
-    }
-    if hub_id is not None:
-        out["hub_id"] = int(hub_id)
-        out["hub"] = str(hub_name)
-    return out
-
-
-def write_test_file(path: Path, rows: List[Dict], summary: Dict, buy_flag_info: Dict, sell_flag_info: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            price = float(r["price"])
-            is_buy = bool(int(r["is_buy"]))
-
-            flag = None
-            if is_buy:
-                if price in buy_flag_info["highliner_prices"]:
-                    flag = "highliner"
-                elif price in buy_flag_info["lowliner_prices"]:
-                    flag = "lowliner"
-            else:
-                if price in sell_flag_info["highliner_prices"]:
-                    flag = "highliner"
-                elif price in sell_flag_info["lowliner_prices"]:
-                    flag = "lowliner"
-
-            obj = {
-                "type_id": int(r["type_id"]),
-                "is_buy_order": is_buy,
-                "volume_remain": int(r["volume_remain"]),
-                "price": float(r["price"]),
-                "issued": format_issued(str(r["issued"])),
-                "order_id": int(r["order_id"]),
-                "flag": flag,
-            }
-            f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-        f.write(json.dumps({"_summary": summary}, ensure_ascii=False) + "\n")
-
-
-def generate_test_outputs(
-    conn: sqlite3.Connection,
-    test_dir: Path,
-    test_type_id: int,
-    type_name: str,
-    hubs: List[Dict],
-) -> None:
-    universe_rows = fetch_raw_segment_rows(conn, test_type_id, None)
-    universe_buy_entries, universe_sell_entries = aggregate_entries_for_flags(universe_rows)
-    universe_buy_info = analyze_buy(universe_buy_entries)
-    universe_sell_info = analyze_sell(universe_sell_entries)
-    universe_summary = summarize_market_line(
-        test_type_id,
-        type_name,
-        None,
-        "universe",
-        universe_buy_entries,
-        universe_sell_entries,
-    )
-    write_test_file(
-        test_dir / "typeUniverseTest.jsonl",
-        universe_rows,
-        universe_summary,
-        universe_buy_info,
-        universe_sell_info,
-    )
-
-    hub_ids = [int(h["stationID"]) for h in hubs]
-    hubs_rows = fetch_raw_segment_rows(conn, test_type_id, hub_ids)
-    hubs_buy_entries, hubs_sell_entries = aggregate_entries_for_flags(hubs_rows)
-    hubs_buy_info = analyze_buy(hubs_buy_entries)
-    hubs_sell_info = analyze_sell(hubs_sell_entries)
-    hubs_summary = summarize_market_line(
-        test_type_id,
-        type_name,
-        None,
-        "hubs",
-        hubs_buy_entries,
-        hubs_sell_entries,
-    )
-    write_test_file(
-        test_dir / "typeHubsTest.jsonl",
-        hubs_rows,
-        hubs_summary,
-        hubs_buy_info,
-        hubs_sell_info,
-    )
-
-    for idx, hub in enumerate(hubs, start=1):
-        hub_id = int(hub["stationID"])
-        hub_name = str(hub["station"])
-        hub_rows = fetch_raw_segment_rows(conn, test_type_id, [hub_id])
-        hub_buy_entries, hub_sell_entries = aggregate_entries_for_flags(hub_rows)
-        hub_buy_info = analyze_buy(hub_buy_entries)
-        hub_sell_info = analyze_sell(hub_sell_entries)
-        hub_summary = summarize_market_line(
-            test_type_id,
-            type_name,
-            hub_id,
-            hub_name,
-            hub_buy_entries,
-            hub_sell_entries,
-        )
-        write_test_file(
-            test_dir / f"typeHub{idx}Test.jsonl",
-            hub_rows,
-            hub_summary,
-            hub_buy_info,
-            hub_sell_info,
-        )
-
-
 def fetch_universe_entries(conn: sqlite3.Connection, type_id: int) -> Tuple[List[Tuple[float, int]], List[Tuple[float, int]]]:
     buy_rows = conn.execute(
         """
@@ -547,8 +365,6 @@ def main() -> None:
     ap.add_argument("--pages-cache", required=True)
     ap.add_argument("--tuning-state", required=True)
     ap.add_argument("--run-metrics-path", required=True)
-    ap.add_argument("--test-type-config", required=True)
-    ap.add_argument("--test-dir", required=True)
     ap.add_argument("--sheets-id", required=True)
     ap.add_argument("--sheets-range", required=True)
     ap.add_argument("--esi-base", required=True)
@@ -572,10 +388,6 @@ def main() -> None:
     pages_cache_path = Path(args.pages_cache)
     tuning_state_path = Path(args.tuning_state)
     run_metrics_path = Path(args.run_metrics_path)
-    test_type_config_path = Path(args.test_type_config)
-    test_dir = Path(args.test_dir)
-
-    test_type_id = load_test_type_id(test_type_config_path)
 
     tuning_state = load_tuning_state(
         tuning_state_path,
@@ -590,16 +402,12 @@ def main() -> None:
     )
 
     LOG.info("Autotuning selected max_workers=%s retry_budget=%s", selected_workers, selected_retry_budget)
-    LOG.info("Test type_id=%s", test_type_id)
 
     try:
         LOG.info("Loading inputs from landu repo at %s", landu_root)
 
         types_path = detect_types_file(landu_root)
         types = load_types(types_path)
-        type_map = {int(t.type_id): str(t.type_name) for t in types}
-        type_name = type_map.get(int(test_type_id), f"type_{test_type_id}")
-
         regions = load_regions(landu_root)
 
         stations_map = load_stations_map(landu_root)
@@ -732,7 +540,6 @@ def main() -> None:
             """
         )
 
-        # Índices para que las consultas directas por type_id sean rápidas y deterministas
         conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_buy_type_price ON universe_buy(type_id, price);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_sell_type_price ON universe_sell(type_id, price);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hubs_buy_type_loc_price ON hubs_buy(type_id, location_id, price);")
@@ -785,15 +592,6 @@ def main() -> None:
 
         write_hubs_json(hubs_out_path, total_orders, hubs)
         LOG.info("Wrote hubs json to %s", hubs_out_path)
-
-        generate_test_outputs(
-            conn=conn,
-            test_dir=test_dir,
-            test_type_id=test_type_id,
-            type_name=type_name,
-            hubs=hubs,
-        )
-        LOG.info("Wrote test files to %s", test_dir)
 
         regions_cache_rows = [(r.region_id, r.region_name, int(observed_regions.get(r.region_id, 1))) for r in regions]
         structs_cache_rows = []
