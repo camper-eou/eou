@@ -16,10 +16,16 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 
 def parse_iso_z(value: str) -> datetime:
+    """
+    Convierte ISO UTC con sufijo Z a datetime aware.
+    """
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def to_sheets_serial(dt: datetime) -> float:
+    """
+    Convierte datetime a número serial de Google Sheets / Excel.
+    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     epoch_seconds = dt.timestamp()
@@ -27,6 +33,11 @@ def to_sheets_serial(dt: datetime) -> float:
 
 
 def batch_update_values(spreadsheet_id: str, data: list[dict]) -> None:
+    """
+    Escribe varias celdas en una sola operación batchUpdate.
+
+    Mantiene reintentos por robustez, pero sin salida informativa.
+    """
     max_attempts = 6
     base_sleep = 2.0
     last_err: Exception | None = None
@@ -54,10 +65,6 @@ def batch_update_values(spreadsheet_id: str, data: list[dict]) -> None:
 
         if attempt < max_attempts:
             sleep_s = (base_sleep * (2 ** (attempt - 1))) + random.uniform(0.0, 1.0)
-            print(
-                f"[Sheets-write] intento {attempt}/{max_attempts} falló "
-                f"({type(last_err).__name__}). Reintentando en {sleep_s:.1f}s..."
-            )
             time.sleep(sleep_s)
 
     raise RuntimeError(
@@ -66,6 +73,12 @@ def batch_update_values(spreadsheet_id: str, data: list[dict]) -> None:
 
 
 def main() -> None:
+    """
+    Lee el summary temporal del run y lo proyecta en la hoja:
+      - status -> columna B
+      - next_run -> columna D
+      - last_modified -> columna I (solo cuando corresponde)
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--spreadsheet-id", required=True)
     ap.add_argument("--sheet-tab", required=True)
