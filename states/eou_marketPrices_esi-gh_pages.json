@@ -43,7 +43,7 @@
     {
       "regionID": 10000009,
       "region": "Insmother",
-      "pages": 3
+      "pages": 4
     },
     {
       "regionID": 10000010,
@@ -78,7 +78,7 @@
     {
       "regionID": 10000016,
       "region": "Lonetrek",
-      "pages": 81
+      "pages": 82
     },
     {
       "regionID": 10000017,
@@ -98,7 +98,7 @@
     {
       "regionID": 10000020,
       "region": "Tash-Murkon",
-      "pages": 43
+      "pages": 44
     },
     {
       "regionID": 10000021,
@@ -128,7 +128,7 @@
     {
       "regionID": 10000028,
       "region": "Molden Heath",
-      "pages": 27
+      "pages": 28
     },
     {
       "regionID": 10000029,
@@ -148,7 +148,7 @@
     {
       "regionID": 10000032,
       "region": "Sinq Laison",
-      "pages": 117
+      "pages": 118
     },
     {
       "regionID": 10000033,
@@ -198,7 +198,7 @@
     {
       "regionID": 10000042,
       "region": "Metropolis",
-      "pages": 121
+      "pages": 125
     },
     {
       "regionID": 10000043,
@@ -313,7 +313,7 @@
     {
       "regionID": 10000065,
       "region": "Kor-Azor",
-      "pages": 25
+      "pages": 26
     },
     {
       "regionID": 10000066,
